@@ -1,5 +1,8 @@
 """Exercise the production confirmation function with an isolated store."""
 
+from concurrent.futures import ThreadPoolExecutor
+from threading import Barrier
+
 import pytest
 
 from substack_publisher_mcp import pending
@@ -63,3 +66,34 @@ def test_expired_token_rejected(monkeypatch):
     )
     assert not confirmed
     assert "expired" in message
+
+
+def test_pending_arguments_are_snapshotted_when_token_is_issued():
+    args = {"tags": ["original"]}
+    confirmed, message = pending.require_confirmation(
+        "add_tags", args, None, lambda: "add original tag"
+    )
+    assert not confirmed
+    token = message.split('confirm_token="')[1].split('"')[0]
+
+    args["tags"][0] = "changed after summary"
+    confirmed, _ = pending.require_confirmation(
+        "add_tags", {"tags": ["changed after summary"]}, token, lambda: "unused"
+    )
+    assert not confirmed
+
+
+def test_concurrent_replay_confirms_at_most_once():
+    token = issue()
+    barrier = Barrier(2)
+
+    def consume():
+        barrier.wait()
+        return pending.require_confirmation(
+            "delete_draft", {"draft_id": "123"}, token, lambda: "unused"
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(lambda _: consume(), range(2)))
+
+    assert sum(confirmed for confirmed, _ in results) == 1

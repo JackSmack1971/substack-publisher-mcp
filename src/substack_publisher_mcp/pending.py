@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import secrets
 import time
+from copy import deepcopy
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict
 
@@ -32,7 +33,9 @@ class PendingActionStore:
 
     def create(self, tool: str, args: Dict[str, Any], summary: str) -> str:
         token = secrets.token_urlsafe(16)
-        self._actions[token] = PendingAction(tool=tool, args=args, summary=summary)
+        self._actions[token] = PendingAction(
+            tool=tool, args=deepcopy(args), summary=summary
+        )
         self._gc()
         return token
 

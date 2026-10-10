@@ -35,7 +35,7 @@ def main() -> None:
         profile = client.get_user_profile()
         name = profile.get("name") or profile.get("email") or "unknown user"
     except Exception as e:
-        print(f"Verification failed: {e}")
+        print(f"Verification failed ({type(e).__name__}).")
         print("Double-check the cookie string and publication URL, then try again.")
         sys.exit(1)
 
