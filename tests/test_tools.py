@@ -40,6 +40,9 @@ CASES = [
     ("schedule_draft", dict(draft_id="123", publish_at_iso="2030-01-02T12:30:00+00:00"),
      "schedule_draft", ("123", datetime.fromisoformat("2030-01-02T12:30:00+00:00")), {}),
     ("delete_draft", dict(draft_id="123"), "delete_draft", ("123",), {}),
+    ("unschedule_draft", dict(draft_id="123"), "unschedule_draft", ("123",), {}),
+    ("add_tags", dict(post_id="123", tags=["news", "updates"]),
+     "add_tags_to_post", ("123", ["news", "updates"]), {}),
 ]
 
 
@@ -60,10 +63,41 @@ def test_confirmation_then_exact_forwarding(client, name, kwargs, method, args, 
 def test_changed_arguments_do_not_mutate(client, name, kwargs, method, args, expected):
     token = token_from(getattr(server, name)(**kwargs))
     changed = dict(kwargs)
-    key = "title" if name == "create_draft" else "draft_id"
+    key = "title" if name == "create_draft" else "post_id" if name == "add_tags" else "draft_id"
     changed[key] = "different"
     assert "don't match" in getattr(server, name)(**changed, confirm_token=token)
     getattr(client, method).assert_not_called()
+
+
+@pytest.mark.parametrize("name,kwargs,other_name,other_kwargs,method", [
+    ("unschedule_draft", {"draft_id": "123"}, "add_tags",
+     {"post_id": "123", "tags": ["news"]}, "unschedule_draft"),
+    ("add_tags", {"post_id": "123", "tags": ["news"]}, "unschedule_draft",
+     {"draft_id": "123"}, "add_tags_to_post"),
+])
+def test_other_mutation_token_cannot_confirm_tool(client, name, kwargs, other_name, other_kwargs, method):
+    token = token_from(getattr(server, name)(**kwargs))
+    assert "invalid" in getattr(server, other_name)(**other_kwargs, confirm_token=token)
+    getattr(client, method).assert_not_called()
+
+
+@pytest.mark.parametrize("name,kwargs,method", [
+    ("unschedule_draft", {"draft_id": "123"}, "unschedule_draft"),
+    ("add_tags", {"post_id": "123", "tags": ["news"]}, "add_tags_to_post"),
+])
+def test_mutation_confirmation_expires(client, monkeypatch, name, kwargs, method):
+    token = token_from(getattr(server, name)(**kwargs))
+    issued_at = pending.store._actions[token].issued_at
+    monkeypatch.setattr(pending.time, "time", lambda: issued_at + 301)
+    assert "invalid" in getattr(server, name)(**kwargs, confirm_token=token)
+    getattr(client, method).assert_not_called()
+
+
+def test_new_mutation_summaries_name_effect_and_target(client):
+    unschedule = server.unschedule_draft("draft-9")
+    assert "Cancel the scheduled publish for draft draft-9" in unschedule
+    tags = server.add_tags("post-4", ["news", "launch"])
+    assert "Add these tags to post post-4: news, launch" in tags
 
 
 def test_update_conflict_requires_new_confirmation_for_override(client):
@@ -103,8 +137,6 @@ def test_get_draft_preserves_markdown_and_warns_about_markers(client):
 @pytest.mark.parametrize("tool,kwargs,method,args,expected", [
     ("list_drafts", {"limit": 50}, "get_drafts", (), {"filter": "draft", "limit": 25}),
     ("list_published", {"limit": 50}, "get_published_posts", (), {"limit": 25}),
-    ("unschedule_draft", {"draft_id": "123"}, "unschedule_draft", ("123",), {}),
-    ("add_tags", {"post_id": "123", "tags": ["news"]}, "add_tags_to_post", ("123", ["news"]), {}),
 ])
 def test_other_argument_forwarding(client, tool, kwargs, method, args, expected):
     getattr(client, method).return_value = []
