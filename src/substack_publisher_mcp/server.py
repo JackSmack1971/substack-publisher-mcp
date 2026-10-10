@@ -5,9 +5,12 @@
 
 from __future__ import annotations
 
+import ipaddress
 import logging
 import os
+import re
 import sys
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlparse
 
@@ -44,6 +47,57 @@ _PUBLICATION_URL: Optional[str] = None
 _client: Optional[SubstackApi] = None
 
 
+def _required_text(value: Any, field: str) -> str | None:
+    if not isinstance(value, str) or not value.strip():
+        return f"{field} must be a non-empty string."
+    return None
+
+
+def _validate_tags(tags: Any, *, required: bool) -> str | None:
+    if tags is None and not required:
+        return None
+    if not isinstance(tags, list) or (required and not tags):
+        if required:
+            return "tags must be a non-empty list of non-empty strings."
+        return "tags must be a list of non-empty strings or omitted."
+    if any(not isinstance(tag, str) or not tag.strip() for tag in tags):
+        return "Each tag must be a non-empty string."
+    return None
+
+
+def _validate_id(value: Any, field: str) -> str | None:
+    return _required_text(value, field)
+
+
+def _validate_limit(limit: Any) -> str | None:
+    if isinstance(limit, bool) or not isinstance(limit, int) or limit <= 0:
+        return "limit must be a positive integer."
+    return None
+
+
+def _valid_hostname(hostname: str | None) -> bool:
+    if not hostname:
+        return False
+    try:
+        ipaddress.ip_address(hostname)
+        return True
+    except ValueError:
+        pass
+    try:
+        ascii_host = hostname.rstrip(".").encode("idna").decode("ascii")
+    except UnicodeError:
+        return False
+    return bool(
+        ascii_host
+        and len(ascii_host) <= 253
+        and all(
+            len(label) <= 63
+            and re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?", label)
+            for label in ascii_host.split(".")
+        )
+    )
+
+
 def _publication_url() -> str:
     global _PUBLICATION_URL
     if _PUBLICATION_URL is None:
@@ -51,9 +105,23 @@ def _publication_url() -> str:
         if not url:
             raise ValueError("SUBSTACK_PUBLICATION_URL must be set")
         parsed = urlparse(url)
-        if not parsed.scheme or not parsed.netloc:
+        try:
+            valid_port = parsed.port is None or 1 <= parsed.port <= 65535
+        except ValueError:
+            valid_port = False
+        if (
+            parsed.scheme.lower() != "https"
+            or not _valid_hostname(parsed.hostname)
+            or parsed.username is not None
+            or parsed.password is not None
+            or not valid_port
+            or any(character.isspace() for character in url)
+            or parsed.query
+            or parsed.fragment
+            or parsed.path not in ("", "/")
+        ):
             raise ValueError(
-                "SUBSTACK_PUBLICATION_URL must be a full URL, e.g. https://you.substack.com"
+                "SUBSTACK_PUBLICATION_URL must be a valid HTTPS publication URL without credentials, query, or fragment"
             )
         _PUBLICATION_URL = url
     return _PUBLICATION_URL
@@ -88,6 +156,9 @@ def _friendly(prefix: str, e: Exception) -> str:
 
 @mcp.tool(description="List recent draft posts (title, id, last updated). Max limit 25.")
 def list_drafts(limit: int = 10) -> str:
+    error = _validate_limit(limit)
+    if error:
+        return error
     client = _client_or_raise()
     try:
         drafts = client.get_drafts(filter="draft", limit=min(limit, 25))
@@ -102,6 +173,9 @@ def list_drafts(limit: int = 10) -> str:
 
 @mcp.tool(description="List recently published posts (title, id, publish date). Max limit 25.")
 def list_published(limit: int = 10) -> str:
+    error = _validate_limit(limit)
+    if error:
+        return error
     client = _client_or_raise()
     try:
         posts = client.get_published_posts(limit=min(limit, 25))
@@ -124,6 +198,9 @@ def list_published(limit: int = 10) -> str:
     )
 )
 def get_draft(draft_id: str) -> str:
+    error = _validate_id(draft_id, "draft_id")
+    if error:
+        return error
     client = _client_or_raise()
     try:
         result = client.export_draft_to_markdown(draft_id)
@@ -200,7 +277,32 @@ def create_draft(
     section_name: Optional[str] = None,
     confirm_token: Optional[str] = None,
 ) -> str:
+    for value, field in ((title, "title"), (markdown, "markdown")):
+        error = _required_text(value, field)
+        if error:
+            return error
+    if not isinstance(audience, str) or audience not in {
+        "everyone", "only_paid", "founding", "only_free"
+    }:
+        return "audience must be one of: everyone, only_paid, founding, only_free."
+    if not isinstance(subtitle, str):
+        return "subtitle must be a string."
+    if not isinstance(markdown, str):
+        return "markdown must be a string."
+    error = _validate_tags(tags, required=False)
+    if error:
+        return error
+    if section_name is not None:
+        error = _required_text(section_name, "section_name")
+        if error:
+            return error
     client = _client_or_raise()
+    section_id = None
+    if section_name:
+        try:
+            section_id = _resolve_section_id(client, section_name)
+        except Exception as e:
+            return _friendly("failed to validate section", e)
     confirm_args: Dict[str, Any] = {
         "title": title,
         "markdown": markdown,
@@ -217,6 +319,8 @@ def create_draft(
             f'- Title: "{title}"\n'
             f'- Subtitle: "{subtitle or "[none]"}"\n'
             f"- Audience: {audience}\n"
+            f"- Tags: {', '.join(tags) if tags else '[none]'}\n"
+            f"- Section: {section_name or '[default]'}\n"
             f"- Content preview: {preview}"
         )
 
@@ -225,7 +329,6 @@ def create_draft(
         return message
 
     try:
-        section_id = _resolve_section_id(client, section_name) if section_name else None
         result = client.create_draft_from_markdown(
             title=title,
             markdown=markdown,
@@ -257,6 +360,15 @@ def update_draft(
     allow_conflict: bool = False,
     confirm_token: Optional[str] = None,
 ) -> str:
+    error = _validate_id(draft_id, "draft_id")
+    if error:
+        return error
+    if not isinstance(markdown, str):
+        return "markdown must be a string."
+    if subtitle is not None and not isinstance(subtitle, str):
+        return "subtitle must be a string when provided."
+    if not isinstance(allow_conflict, bool):
+        return "allow_conflict must be a boolean."
     client = _client_or_raise()
     confirm_args: Dict[str, Any] = {
         "draft_id": draft_id,
@@ -268,7 +380,9 @@ def update_draft(
     def summarize() -> str:
         base = f"Replace the content of draft {draft_id} with new markdown ({len(markdown)} characters)."
         if subtitle is not None:
-            base += " Subtitle will also change."
+            base += f' Subtitle will be set to "{subtitle or "[empty]"}".'
+        if allow_conflict:
+            base += " Conflict checks will be overridden."
         return base
 
     confirmed, message = require_confirmation("update_draft", confirm_args, confirm_token, summarize)
@@ -300,6 +414,11 @@ def publish_draft(
     share_automatically: bool = False,
     confirm_token: Optional[str] = None,
 ) -> str:
+    error = _validate_id(draft_id, "draft_id")
+    if error:
+        return error
+    if not isinstance(send, bool) or not isinstance(share_automatically, bool):
+        return "send and share_automatically must be booleans."
     client = _client_or_raise()
     confirm_args: Dict[str, Any] = {
         "draft_id": draft_id,
@@ -314,7 +433,15 @@ def publish_draft(
         except Exception:
             title = "(unable to fetch title)"
         email_note = "This will email all subscribers." if send else "Email sending is OFF for this publish."
-        return f'Publish draft "{title}" (ID: {draft_id}) now.\n{email_note}\nThis cannot be undone.'
+        share_note = (
+            "Automatic sharing is ON."
+            if share_automatically
+            else "Automatic sharing is OFF."
+        )
+        return (
+            f'Publish draft "{title}" (ID: {draft_id}) now.\n'
+            f"{email_note}\n{share_note}\nThis cannot be undone."
+        )
 
     confirmed, message = require_confirmation("publish_draft", confirm_args, confirm_token, summarize)
     if not confirmed:
@@ -335,8 +462,17 @@ def publish_draft(
     )
 )
 def schedule_draft(draft_id: str, publish_at_iso: str, confirm_token: Optional[str] = None) -> str:
-    from datetime import datetime
-
+    error = _validate_id(draft_id, "draft_id")
+    if error:
+        return error
+    try:
+        dt = datetime.fromisoformat(publish_at_iso)
+    except (TypeError, ValueError):
+        return "publish_at_iso must be a valid ISO 8601 datetime with a timezone offset."
+    if dt.tzinfo is None or dt.utcoffset() is None:
+        return "publish_at_iso must include a timezone offset, such as +00:00."
+    if dt <= datetime.now(timezone.utc).astimezone(dt.tzinfo):
+        return "publish_at_iso must be in the future."
     client = _client_or_raise()
     confirm_args: Dict[str, Any] = {"draft_id": draft_id, "publish_at_iso": publish_at_iso}
 
@@ -350,7 +486,6 @@ def schedule_draft(draft_id: str, publish_at_iso: str, confirm_token: Optional[s
         return message
 
     try:
-        dt = datetime.fromisoformat(publish_at_iso)
         client.schedule_draft(draft_id, dt)
         return f"Draft {draft_id} scheduled for {publish_at_iso}."
     except Exception as e:
@@ -364,6 +499,9 @@ def schedule_draft(draft_id: str, publish_at_iso: str, confirm_token: Optional[s
     )
 )
 def unschedule_draft(draft_id: str, confirm_token: Optional[str] = None) -> str:
+    error = _validate_id(draft_id, "draft_id")
+    if error:
+        return error
     client = _client_or_raise()
     confirm_args: Dict[str, Any] = {"draft_id": draft_id}
     confirmed, message = require_confirmation(
@@ -389,6 +527,9 @@ def unschedule_draft(draft_id: str, confirm_token: Optional[str] = None) -> str:
     )
 )
 def delete_draft(draft_id: str, confirm_token: Optional[str] = None) -> str:
+    error = _validate_id(draft_id, "draft_id")
+    if error:
+        return error
     client = _client_or_raise()
     confirm_args: Dict[str, Any] = {"draft_id": draft_id}
 
@@ -418,6 +559,9 @@ def delete_draft(draft_id: str, confirm_token: Optional[str] = None) -> str:
     )
 )
 def add_tags(post_id: str, tags: List[str], confirm_token: Optional[str] = None) -> str:
+    error = _validate_id(post_id, "post_id") or _validate_tags(tags, required=True)
+    if error:
+        return error
     client = _client_or_raise()
     confirm_args: Dict[str, Any] = {"post_id": post_id, "tags": tags}
     confirmed, message = require_confirmation(
