@@ -26,6 +26,7 @@ asyncio_mode = "auto"
 [project.scripts]
 substack-publisher-mcp = "substack_publisher_mcp.server:main"
 substack-publisher-mcp-setup = "substack_publisher_mcp.setup_auth:main"
+substack-publisher-mcp-qualify = "substack_publisher_mcp.live_verify:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/substack_publisher_mcp"]

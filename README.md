@@ -22,11 +22,26 @@ stdio, completes MCP initialization, and advertises all 12 tools. Tests do not
 need credentials and do not publish or contact Substack. They do not establish
 that Substack's live endpoints currently work.
 
-Setup asks for your publication URL and a Cookie request header value copied
-from an authenticated request in browser DevTools → Network. A single cookie
-must include its name: `substack.sid=COOKIE_VALUE`, rather than the bare value.
-Input is hidden. Setup verifies the credentials before storing them in the OS
-keyring; this step contacts Substack.
+For this publication, setup asks for `https://brettousignant.substack.com` and
+the value of one browser cookie. In Chrome or Edge, sign in to that publication,
+press **F12**, open **Application** (Chrome) or **Storage** (Edge), then
+**Cookies**. Select the Substack domain (`https://substack.com` or the matching
+Substack domain shown) and find the row named `substack.sid`. Copy only its
+**Value** cell. Run `uv run --locked substack-publisher-mcp-setup` and paste
+that value at the hidden prompt; setup adds `substack.sid=` automatically. You
+can also enter `substack.sid=VALUE`. Do not copy a `Cookie:` header. Setup checks
+the HTTPS publication URL and cookie format locally, then validates the session
+with the restricted read-only requests before saving it to the OS keyring. It
+never reads browser cookie files or prints the value. Validation contacts
+Substack.
+
+To separately inspect a redirect without saving credentials, run
+`uv run --locked substack-publisher-mcp-setup --diagnose-redirect` locally.
+This mode requires the exact publication URL above and a freshly supplied
+hidden cookie value. It makes only the client's two constructor GET requests,
+blocks redirects, prints only response statuses and a safely parsed redirect
+host/path, then closes the session. It does not read environment or keyring
+credentials, persist the cookie, or authorize any further live requests.
 
 Add this entry to your MCP client's configuration, replacing the path and URL:
 
@@ -112,6 +127,60 @@ The MCP client calls `server.py`, which validates confirmation through `pending.
 and forwards operations to `python-substack`. `auth.py` creates the client using
 environment credentials or the OS keyring. `setup_auth.py` verifies and stores
 credentials interactively. Authentication is lazy, on the first tool call.
+Setup validates the cookie through the same bounded, GET-only restricted session
+used by live qualification, and writes to the exact publication URL key only
+after the authenticated profile request succeeds.
+
+## Stage 3 live compatibility qualification
+
+Live compatibility is **UNVERIFIED** until an operator explicitly runs the
+qualification command and receives a `SUPPORTED` report. The verifier is
+separate from the MCP tools and supports cookie authentication only. It never
+uses email/password login because the locked client logs in with POST.
+
+The default run checks authenticated client initialization (including the
+client's implicit profile and publication sign-in GETs), publication sections,
+one draft-list result, and one published-post-list result. Subscriber counts
+are not requested. To include one draft Markdown retrieval, pass that draft's
+numeric identifier of at most 20 digits explicitly with `--draft-id`; the report
+never includes article or draft content.
+
+First ensure the existing cookie is available through `SUBSTACK_COOKIES_STRING`
+or the OS keyring entry created by `substack-publisher-mcp-setup`. Then review
+the target publication and explicitly authorize external requests:
+
+```sh
+substack-publisher-mcp-qualify --publication-url https://your-publication.substack.com --live
+```
+
+Optional single-draft retrieval:
+
+```sh
+substack-publisher-mcp-qualify --publication-url https://your-publication.substack.com --live --draft-id 123456
+```
+
+Without `--live`, no credential lookup, client construction, or network request
+occurs. The command accepts only HTTPS to the configured publication host and
+the two `substack.com` initialization endpoints. It allows GET on the exact
+qualification routes, rejects every other method and destination, does not
+follow redirects, disables retries, uses bounded timeouts, and limits the run
+to six requests. Email/password credentials are not used. This boundary is
+independent of MCP tool descriptions.
+
+The JSON report includes timestamp, runtime/library versions, publication host,
+operation names, HTTP statuses where available, response shape counts, a
+result classification, and limitations. It excludes cookies, response bodies,
+article text, private draft content, subscriber identities, and provider
+payloads. Save or share the report only after reviewing it for local policy;
+never attach cookie values or raw HTTP traces. A timeout or 429 is inconclusive
+and is classified as `TRANSIENT_ERROR` or `RATE_LIMITED`, not unsupported.
+Other result classes are `AUTH_FAILURE`, `PERMISSION_DENIED`, `ENDPOINT_DRIFT`,
+`RESPONSE_CONTRACT_MISMATCH`, and `BLOCKED`. Qualification proves compatibility
+only for the approved account, publication, endpoints, and time of execution.
+
+The command is intentionally not run as part of development or CI. Offline
+tests exercise the boundary with synthetic requests and do not establish live
+Substack compatibility.
 
 ```text
 src/substack_publisher_mcp/  Server, confirmation store, authentication, setup CLI
@@ -129,6 +198,7 @@ uv.lock                     Exact resolved dependency baseline, including dev to
 | `uv run --locked --extra dev pytest -q tests/test_startup.py` | Check the installed entry point and MCP handshake |
 | `uv run --locked substack-publisher-mcp` | Run the stdio server |
 | `uv run --locked substack-publisher-mcp-setup` | Verify and save browser credentials |
+| `uv run --locked substack-publisher-mcp-qualify` | Print a no-network report unless explicitly given `--live` |
 | `uv lock --upgrade` | Intentionally update resolved dependencies; review the lock diff and rerun tests |
 
 ## Stack inventory
@@ -171,7 +241,10 @@ or typecheck command in this repository.
 | MCP client cannot find the command | Virtual environment executable is absent or path is wrong | Run `uv sync --locked --extra dev --python 3.11` and configure its absolute CLI path |
 | Publication URL error | Missing or incomplete URL | Set `SUBSTACK_PUBLICATION_URL` to the full `https://…` URL |
 | No credentials or keyring backend error | Setup not run, different URL, or no OS keyring backend | Run setup with the exact configured URL; alternatively supply `SUBSTACK_COOKIES_STRING` |
-| CAPTCHA during login | Email/password authentication challenged | Use a Cookie header from an authenticated browser session |
+| Setup reports `AUTH_FAILURE` (HTTP 401) | The profile endpoint rejected the session | Confirm the response is from the profile check before replacing the cookie |
+| Setup reports `REDIRECT` | The restricted check received a redirect; authentication is inconclusive | Review the sanitized host, path, and status. Setup does not follow the redirect or save the cookie; do not infer expiration from the redirect alone |
+| Setup cannot reach Substack | Network timeout, firewall, VPN, or connectivity issue | Check the connection and retry; setup does not retry or bypass its restricted request boundary |
+| Setup reports keyring save failure | Windows keyring backend is unavailable | Enable a Windows Credential Manager keyring and rerun setup |
 | Conflict on update | Missing revision marker or draft changed remotely | Fetch with `get_draft`, retain markers, reapply edits, and obtain a fresh confirmation |
 | Invalid confirmation token | Expired, consumed, or server restarted | Call again without the token and request confirmation again |
 

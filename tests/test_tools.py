@@ -332,3 +332,48 @@ def test_conflict_response_does_not_echo_exception_details(client, caplog):
     assert "get_draft" in response
     assert sensitive_detail not in response
     assert sensitive_detail not in caplog.text
+
+
+@pytest.mark.parametrize("name,kwargs,method,recovery", [
+    ("create_draft", {"title": "Title", "markdown": "body"}, "create_draft_from_markdown", "list_drafts"),
+    ("update_draft", {"draft_id": "123", "markdown": "body"}, "update_draft_from_markdown", "get_draft"),
+    ("publish_draft", {"draft_id": "123"}, "publish_draft", "list_published"),
+    ("schedule_draft", {"draft_id": "123", "publish_at_iso": "2030-01-02T12:30:00+00:00"}, "schedule_draft", "scheduling state"),
+    ("unschedule_draft", {"draft_id": "123"}, "unschedule_draft", "scheduling state"),
+    ("delete_draft", {"draft_id": "123"}, "delete_draft", "list_drafts"),
+    ("add_tags", {"post_id": "123", "tags": ["news"]}, "add_tags_to_post", "current tags"),
+])
+def test_ambiguous_mutation_failure_requires_state_inspection_and_fresh_confirmation(
+    client, caplog, name, kwargs, method, recovery
+):
+    secret = "cookie=private response body=do-not-leak"
+    getattr(client, method).side_effect = SubstackAPIException(500, secret)
+    tool = getattr(server, name)
+    token = token_from(tool(**kwargs))
+
+    response = tool(**kwargs, confirm_token=token)
+
+    assert "outcome is unknown" in response
+    assert "Do not retry this mutation yet" in response
+    assert recovery in response
+    assert secret not in response
+    assert secret not in caplog.text
+    getattr(client, method).assert_called_once()
+    assert "invalid" in tool(**kwargs, confirm_token=token)
+    getattr(client, method).assert_called_once()
+    # Issuing another token confirms intent only; it never repeats the call.
+    fresh = token_from(tool(**kwargs))
+    assert fresh != token
+    getattr(client, method).assert_called_once()
+
+
+def test_read_only_api_failure_retains_safe_retry_guidance(client, caplog):
+    secret = "private cookie and response payload"
+    client.get_drafts.side_effect = SubstackAPIException(500, secret)
+
+    response = server.list_drafts()
+
+    assert "Read-only" in response
+    assert "retry the read" in response
+    assert secret not in response
+    assert secret not in caplog.text

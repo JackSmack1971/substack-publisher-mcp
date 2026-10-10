@@ -152,16 +152,27 @@ def _friendly(prefix: str, e: Exception) -> str:
     logger.error("%s (%s)", prefix, type(e).__name__)
     if isinstance(e, DraftConflictError):
         return (
-            "Conflict: the draft changed on Substack since it was last fetched. "
-            "Call get_draft again to get the current content and revision marker, "
-            "reapply your edits, and try again — or pass allow_conflict=true to "
-            "overwrite anyway."
+            "Conflict: Substack reported that the draft changed since it was last "
+            "fetched. Call get_draft for the current content and revision marker, "
+            "then review and reapply your edits. To overwrite despite the conflict, "
+            "make a new confirmed call with allow_conflict=true."
         )
     if isinstance(e, SubstackAPIException):
-        return "Substack API request failed. Check the publication and authentication, then retry."
+        return "Read-only Substack API request failed. Check the publication and authentication, then retry the read."
     if isinstance(e, _SectionNotFoundError):
         return str(e)
     return f"Error: {prefix}. See server logs for the exception type."
+
+
+def _mutation_failure(prefix: str, e: Exception, recovery: str) -> str:
+    """Report uncertain post-dispatch mutation outcomes without exposing details."""
+    if isinstance(e, DraftConflictError):
+        return _friendly(prefix, e)
+    logger.error("%s (%s)", prefix, type(e).__name__)
+    return (
+        f"{prefix.capitalize()}: the request may have reached Substack, so the "
+        f"outcome is unknown. Do not retry this mutation yet. {recovery}"
+    )
 
 
 # ---- read-only tools -------------------------------------------------
@@ -359,7 +370,10 @@ def create_draft(
         draft = result["draft"]
         return f"Draft created.\nID: {draft.get('id')}\nTitle: {title}"
     except Exception as e:
-        return _friendly("failed to create draft", e)
+        return _mutation_failure(
+            "could not confirm draft creation", e,
+            "Call list_drafts and inspect for an existing draft with the same title/content before deciding what to do.",
+        )
 
 
 @mcp.tool(
@@ -417,7 +431,10 @@ def update_draft(
         )
         return f"Draft {draft_id} updated."
     except Exception as e:
-        return _friendly(f"failed to update draft {draft_id}", e)
+        return _mutation_failure(
+            f"could not confirm update of draft {draft_id}", e,
+            f"Call get_draft for {draft_id} and inspect its current content and revision marker before deciding whether another update is needed.",
+        )
 
 
 @mcp.tool(
@@ -470,7 +487,10 @@ def publish_draft(
         client.publish_draft(draft_id, send=send, share_automatically=share_automatically)
         return f"Draft {draft_id} published."
     except Exception as e:
-        return _friendly(f"failed to publish draft {draft_id}", e)
+        return _mutation_failure(
+            f"could not confirm publication of draft {draft_id}", e,
+            f"Call list_published and inspect Substack to verify publication status before considering another publish attempt.",
+        )
 
 
 @mcp.tool(
@@ -508,7 +528,10 @@ def schedule_draft(draft_id: str, publish_at_iso: str, confirm_token: Optional[s
         client.schedule_draft(draft_id, dt)
         return f"Draft {draft_id} scheduled for {publish_at_iso}."
     except Exception as e:
-        return _friendly(f"failed to schedule draft {draft_id}", e)
+        return _mutation_failure(
+            f"could not confirm scheduling of draft {draft_id}", e,
+            "Check the draft's current scheduling state in Substack before changing it again; existing MCP read tools do not expose that state.",
+        )
 
 
 @mcp.tool(
@@ -536,7 +559,10 @@ def unschedule_draft(draft_id: str, confirm_token: Optional[str] = None) -> str:
         client.unschedule_draft(draft_id)
         return f"Schedule cancelled for draft {draft_id}."
     except Exception as e:
-        return _friendly(f"failed to unschedule draft {draft_id}", e)
+        return _mutation_failure(
+            f"could not confirm unscheduling of draft {draft_id}", e,
+            "Check the draft's current scheduling state in Substack before changing it again; existing MCP read tools do not expose that state.",
+        )
 
 
 @mcp.tool(
@@ -568,7 +594,10 @@ def delete_draft(draft_id: str, confirm_token: Optional[str] = None) -> str:
         client.delete_draft(draft_id)
         return f"Draft {draft_id} deleted."
     except Exception as e:
-        return _friendly(f"failed to delete draft {draft_id}", e)
+        return _mutation_failure(
+            f"could not confirm deletion of draft {draft_id}", e,
+            f"Call list_drafts to verify whether draft {draft_id} still exists before deciding what to do.",
+        )
 
 
 @mcp.tool(
@@ -596,7 +625,10 @@ def add_tags(post_id: str, tags: List[str], confirm_token: Optional[str] = None)
         client.add_tags_to_post(post_id, tags)
         return f"Tags added to post {post_id}: {', '.join(tags)}"
     except Exception as e:
-        return _friendly(f"failed to add tags to post {post_id}", e)
+        return _mutation_failure(
+            f"could not confirm tags for post {post_id}", e,
+            "Inspect the post's current tags in Substack before adding them again; existing MCP read tools do not expose post tags.",
+        )
 
 
 def main() -> None:

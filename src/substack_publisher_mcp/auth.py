@@ -7,12 +7,24 @@ import logging
 import os
 
 import keyring
+from requests.adapters import Retry
 from substack import Api as SubstackApi
 
 logger = logging.getLogger(__name__)
 
 SERVICE_NAME = "substack-publisher-mcp"
 COOKIE_KEY = "cookies_string"
+
+
+def _disable_delete_retries(client: SubstackApi) -> SubstackApi:
+    """python-substack retries DELETE on 429, which can repeat mutations."""
+    for adapter in client._session.adapters.values():
+        retry = adapter.max_retries
+        if isinstance(retry, Retry) and "DELETE" in retry.allowed_methods:
+            adapter.max_retries = retry.new(
+                allowed_methods=retry.allowed_methods - {"DELETE"}
+            )
+    return client
 
 
 def store_cookie_string(publication_url: str, cookies_string: str) -> None:
@@ -43,20 +55,24 @@ def build_client(publication_url: str) -> SubstackApi:
       2. Cookie string stored in the OS keychain by `substack-publisher-mcp-setup`
       3. SUBSTACK_EMAIL / SUBSTACK_PASSWORD env vars (may trigger a CAPTCHA)
 
-    A cookie string is the recommended path: open the publication in a logged-in
-    browser, copy the Cookie header (or `substack.sid=<value>`) via dev
-    tools, and either set SUBSTACK_COOKIES_STRING or run the setup command once.
+    A cookie string is the recommended path: in a logged-in browser, copy the
+    `substack.sid` value from DevTools and either set SUBSTACK_COOKIES_STRING
+    (as `substack.sid=<value>`) or run the setup command once.
     """
     env_cookies = os.getenv("SUBSTACK_COOKIES_STRING")
     if env_cookies:
         logger.info("Authenticating with SUBSTACK_COOKIES_STRING")
-        return SubstackApi(cookies_string=env_cookies, publication_url=publication_url)
+        return _disable_delete_retries(
+            SubstackApi(cookies_string=env_cookies, publication_url=publication_url)
+        )
 
     stored_cookies = get_stored_cookie_string(publication_url)
     if stored_cookies:
         logger.info("Authenticating with stored cookie string")
         try:
-            return SubstackApi(cookies_string=stored_cookies, publication_url=publication_url)
+            return _disable_delete_retries(
+                SubstackApi(cookies_string=stored_cookies, publication_url=publication_url)
+            )
         except Exception as e:
             logger.warning(
                 "Stored cookie authentication failed (%s); clearing it",
@@ -69,7 +85,9 @@ def build_client(publication_url: str) -> SubstackApi:
     if email and password:
         logger.info("Authenticating with email/password")
         try:
-            return SubstackApi(email=email, password=password, publication_url=publication_url)
+            return _disable_delete_retries(
+                SubstackApi(email=email, password=password, publication_url=publication_url)
+            )
         except Exception as e:
             if "captcha" in str(e).lower():
                 raise AuthError(
