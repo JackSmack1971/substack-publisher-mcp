@@ -44,7 +44,7 @@ def build_client(publication_url: str) -> SubstackApi:
       3. SUBSTACK_EMAIL / SUBSTACK_PASSWORD env vars (may trigger a CAPTCHA)
 
     A cookie string is the recommended path: open the publication in a logged-in
-    browser, copy the Cookie header (or the `substack.sid` cookie value) via dev
+    browser, copy the Cookie header (or `substack.sid=<value>`) via dev
     tools, and either set SUBSTACK_COOKIES_STRING or run the setup command once.
     """
     env_cookies = os.getenv("SUBSTACK_COOKIES_STRING")
