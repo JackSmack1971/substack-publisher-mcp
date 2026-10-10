@@ -1,116 +1,182 @@
 # Substack Publisher MCP
 
-An unofficial MCP server for Substack — create, edit, and publish posts from Claude
-(or any MCP client), with real Markdown formatting and server-enforced confirmation
-on destructive actions.
+An unofficial MCP server for authors who want to create, edit, and publish
+Substack posts from an MCP client using Markdown and a two-step confirmation flow.
+It wraps `python-substack`, which uses Substack's internal endpoints and can break
+when those endpoints change. This project is not affiliated with Substack Inc.
 
-**Unofficial.** Substack has no public API. This wraps
-[`python-substack`](https://github.com/ma2za/python-substack), which uses
-Substack's internal web endpoints. It can break if Substack changes them.
+## Quickstart
 
-## Why this exists
+Prerequisites: Python 3.10+ and [uv](https://docs.astral.sh/uv/), plus a logged-in
+Substack browser session and a working OS keyring for interactive credential setup.
+From a checkout of this repository, install the locked environment, run tests to verify startup, then configure credentials:
 
-[`substack-mcp-plus`](https://github.com/ty13r/substack-mcp-plus) is an existing,
-more widely-used server that does something similar. This project started as an
-analysis of that codebase. Two things stood out:
-
-1. **Its headline bug — bold/italic/lists/blockquotes rendering as literal
-   `**markdown**` syntax instead of formatted text — is a bug in its own
-   converter, not a Substack limitation.** Its hand-rolled `MarkdownConverter`
-   builds correct structured blocks, but `post_handler.py`'s
-   `_add_blocks_to_post()` only passes that structure through for plain
-   paragraphs. Headings, list items, and blockquotes are instead flattened
-   through `_extract_text_from_content()`, which re-serializes bold/italic
-   marks back into `**text**` strings and hands the API plain text — so
-   Substack renders exactly what it's given: the markdown syntax, literally.
-
-2. **The `python-substack` library it depends on has moved on.** The project's
-   docs describe it as unmaintained for 2+ years and blame it for missing
-   scheduling and broken images. The current release (0.10.0) has a
-   CommonMark-based renderer (`markdown-it-py`, not regex), one-call
-   `create_draft_from_markdown` / `update_draft_from_markdown` methods that
-   handle images/tags/scheduling/publishing, **optimistic-concurrency conflict
-   detection** on updates, and working `schedule_draft`/`unschedule_draft`.
-   None of this is used — the project still maintains ~2,500 lines of its own
-   block-building and content-extraction logic that duplicates (and in the
-   cases above, breaks) what the library now does natively.
-
-This server is a thin layer over that modern API surface instead of a parallel
-reimplementation, plus one structural fix described below.
-
-## What's different, concretely
-
-| | substack-mcp-plus | this project |
-|---|---|---|
-| Markdown parsing | Hand-rolled regex converter | `markdown-it-py` (CommonMark) via the library |
-| Bold/italic in headings, lists, blockquotes | Broken (shows as `**text**`) | Correct |
-| Concurrent-edit safety | None — last write wins | Revision marker + conflict detection; refuses stale updates unless you opt in |
-| Scheduling | Removed ("404 errors") | Works (current library targets the live endpoint) |
-| Tags | Not supported | Supported |
-| Confirmation on publish/delete | A sentence in the tool description asking the calling model to wait — nothing stops it from skipping that | Server-issued, single-use token; the second call is rejected without a token the server itself generated |
-| Auth | Browser automation + CAPTCHA solving + dual keyring/file storage paths | Paste one cookie string, stored once |
-| Tool count | 12, several duplicating library logic | 11, each a thin pass-through |
-
-### The confirmation design specifically
-
-substack-mcp-plus's safety mechanism is entirely in the tool's natural-language
-description: *"you MUST ask the user to confirm... never set confirm=true on
-the first request."* That's an instruction to the calling model, not a
-constraint the server enforces — a model that ignores it, or is manipulated by
-injected content into ignoring it, hits publish or delete with nothing to
-stop it.
-
-Here, the first call to a destructive tool (`create_draft`, `update_draft`,
-`publish_draft`, `schedule_draft`, `delete_draft`) always returns a summary and
-a random server-generated `confirm_token` — it never acts. The action only
-executes if a second call supplies that exact token, scoped to that tool and
-those arguments, and it expires in 5 minutes. A model can still choose not to
-show the user the summary, but it cannot *act* without a token only the server
-can produce.
-
-## Setup
-
-```bash
-pip install -e .
-substack-publisher-mcp-setup
+```sh
+uv sync --locked --extra dev --python 3.11
+uv run --locked --extra dev pytest -q
+uv run --locked substack-publisher-mcp-setup
 ```
 
-The setup script asks for your publication URL and a cookie string (copied
-from your browser's dev tools while logged into Substack), verifies it, and
-stores it via your OS keychain (`keyring`).
+The tests include an offline startup smoke test: the installed CLI starts over
+stdio, completes MCP initialization, and advertises all 12 tools. Tests do not
+need credentials and do not publish or contact Substack. They do not establish
+that Substack's live endpoints currently work.
 
-Then add to your MCP client config:
+Setup asks for your publication URL and a Cookie request header value copied
+from an authenticated request in browser DevTools → Network. A single cookie
+must include its name: `substack.sid=COOKIE_VALUE`, rather than the bare value.
+Input is hidden. Setup verifies the credentials before storing them in the OS
+keyring; this step contacts Substack.
+
+Add this entry to your MCP client's configuration, replacing the path and URL:
 
 ```json
 {
   "mcpServers": {
     "substack-publisher-mcp": {
-      "command": "substack-publisher-mcp",
+      "command": "/absolute/path/to/checkout/.venv/bin/substack-publisher-mcp",
       "env": { "SUBSTACK_PUBLICATION_URL": "https://yourpub.substack.com" }
     }
   }
 }
 ```
 
-## Tools
+On Windows, use the absolute path to `.venv\\Scripts\\substack-publisher-mcp.exe`
+with JSON-escaped backslashes. Use the same publication URL as during setup,
+including any trailing slash: keyring entries are keyed by the exact URL string.
+The client launches the stdio server; running the CLI manually waits for MCP input.
 
-- `list_drafts`, `list_published` — browse posts
-- `get_draft` — fetch a draft as Markdown with an embedded revision marker
-- `create_draft` — new draft from Markdown (title, subtitle, audience, tags, section)
-- `update_draft` — replace a draft's content; detects and refuses stale overwrites
-- `publish_draft` — publish immediately (confirmation required)
-- `schedule_draft` / `unschedule_draft` — schedule or cancel a future publish
-- `delete_draft` — permanent delete (confirmation required)
-- `add_tags`, `get_sections`, `get_subscriber_count`
+## Features and usage
 
-## Known limitations
+| Tool | Behavior |
+|---|---|
+| `list_drafts`, `list_published` | List recent posts; limit capped at 25 |
+| `get_draft` | Export Markdown with revision and preservation markers |
+| `get_sections`, `get_subscriber_count` | Read publication metadata |
+| `create_draft` | Create from Markdown with title, subtitle, audience, tags, and optional section name |
+| `update_draft` | Replace the body, optionally change subtitle, with revision conflict checks |
+| `publish_draft` | Publish now; `send` defaults to true, `share_automatically` to false |
+| `schedule_draft` | Schedule using an ISO 8601 datetime; include a timezone offset |
+| `unschedule_draft` | Cancel a scheduled publish |
+| `delete_draft` | Permanently delete a draft |
+| `add_tags` | Add tags to a draft or published post |
 
-- Still unofficial, still reverse-engineered, still can break without notice.
-- Embeds, polls, and other block types with no Markdown equivalent are
-  preserved on round-trip but can't be authored through this tool.
-- No image upload tool yet (the library supports it via `get_image()`; not
-  wired up to an MCP tool in this first pass).
+Markdown rendering is delegated to the library's CommonMark renderer, with
+extensions such as footnotes and strikethrough. This server does not implement a
+separate Markdown converter.
+
+### Confirmation
+
+`create_draft`, `update_draft`, `publish_draft`, `schedule_draft`, and `delete_draft`
+require two calls. First omit `confirm_token`, show the returned summary to the
+user, and obtain explicit approval. Then repeat the same arguments with the
+returned token. Tokens are scoped to the tool and arguments, single-use, expire
+after five minutes, and live only in this server process. Restarting loses them.
+A failed validation or API attempt consumes the token; start again for a retry.
+
+This enforces a second call with a valid token. It cannot prove that a client
+actually asked a human for approval. `unschedule_draft` and `add_tags` mutate
+remote state without this confirmation gate.
+
+### Editing safely
+
+Call `get_draft`, edit the Markdown body, and pass the returned Markdown portion
+(including revision and preservation markers, excluding the explanatory heading)
+to `update_draft`. Updates with missing or stale revision metadata are refused by
+the library unless `allow_conflict=true`. An override changes the confirmed
+arguments and requires a fresh confirmation flow. It does not bypass other
+library safeguards.
+
+Unsupported blocks such as embeds and polls are represented by preservation
+markers. Keep those markers unchanged; the library refuses missing or altered
+unsupported blocks. The tool does not expose `allow_unsupported_change` or
+`allow_image_replacement`. There is no standalone image upload tool, and these
+unsupported blocks cannot be authored through this server.
+
+## Configuration
+
+Authentication resolves in the order below; use cookie authentication when
+possible. No credentials are needed just to start the server or list its tools.
+
+| Variable or storage | Required/default | Purpose |
+|---|---|---|
+| `SUBSTACK_PUBLICATION_URL` | Required when calling Substack tools | Full publication URL |
+| `SUBSTACK_COOKIES_STRING` | Optional, first preference | Cookie header string; bypasses keyring lookup |
+| OS keyring | Optional, second preference | Cookie saved by setup for the exact publication URL |
+| `SUBSTACK_EMAIL`, `SUBSTACK_PASSWORD` | Optional, final fallback | Both required; login may encounter CAPTCHA |
+
+## Architecture and directory structure
+
+The MCP client calls `server.py`, which validates confirmation through `pending.py`
+and forwards operations to `python-substack`. `auth.py` creates the client using
+environment credentials or the OS keyring. `setup_auth.py` verifies and stores
+credentials interactively. Authentication is lazy, on the first tool call.
+
+```text
+src/substack_publisher_mcp/  Server, confirmation store, authentication, setup CLI
+tests/                      Confirmation, mocked tools, real stdio startup
+pyproject.toml              Package metadata, dependency ranges, CLI entry points
+uv.lock                     Exact resolved dependency baseline, including dev tools
+```
+
+## Developer command center
+
+| Command | Purpose |
+|---|---|
+| `uv sync --locked --extra dev --python 3.11` | Create/sync the baseline development environment |
+| `uv run --locked --extra dev pytest -q` | Run the complete offline suite |
+| `uv run --locked --extra dev pytest -q tests/test_startup.py` | Check the installed entry point and MCP handshake |
+| `uv run --locked substack-publisher-mcp` | Run the stdio server |
+| `uv run --locked substack-publisher-mcp-setup` | Verify and save browser credentials |
+| `uv lock --upgrade` | Intentionally update resolved dependencies; review the lock diff and rerun tests |
+
+## Stack inventory
+
+The baseline uses Python 3.11, MCP 2.3.0, python-substack 0.10.0, and keyring
+25.7.0; all transitive and development versions are in `uv.lock`. The manifest
+allows Python 3.10+ and MCP 2.x starting at 2.3.0. Use `--locked` to reject stale
+lockfiles. Editable pip installs follow manifest ranges and do not reproduce the
+lockfile.
+
+## Reproducibility & maintenance
+
+For a fresh clone, install and verify the locked baseline:
+
+```sh
+uv sync --locked --extra dev --python 3.11
+uv run --locked --extra dev pytest -q
+```
+
+When updating dependencies, review the lock diff and rerun the suite. Verify the
+minimum Python with `uv run --isolated --python 3.10 --locked --extra dev pytest -q`.
+Recreate local environments with `uv sync`; confirmation state clears
+when the server exits, while stored keyring credentials persist.
+
+## Testing & verification
+
+Confirmation tests call the production function with a fresh store per test.
+Mocked tool tests verify no mutation before confirmation, exact argument
+forwarding, replay/mismatch rejection, and conflict override confirmation.
+The stdio smoke test checks the actual installed CLI and dependency integration.
+There is no CI workflow, lint command, or typecheck command in this repository.
+
+## Troubleshooting
+
+| Symptom | Likely cause | Fix |
+|---|---|---|
+| MCP client cannot find the command | Virtual environment executable is absent or path is wrong | Run `uv sync --locked --extra dev --python 3.11` and configure its absolute CLI path |
+| Publication URL error | Missing or incomplete URL | Set `SUBSTACK_PUBLICATION_URL` to the full `https://…` URL |
+| No credentials or keyring backend error | Setup not run, different URL, or no OS keyring backend | Run setup with the exact configured URL; alternatively supply `SUBSTACK_COOKIES_STRING` |
+| CAPTCHA during login | Email/password authentication challenged | Use a Cookie header from an authenticated browser session |
+| Conflict on update | Missing revision marker or draft changed remotely | Fetch with `get_draft`, retain markers, reapply edits, and obtain a fresh confirmation |
+| Invalid confirmation token | Expired, consumed, or server restarted | Call again without the token and request confirmation again |
+
+## Contributing and project status
+
+Contribution guidelines are not yet formalized. Open an issue before large
+changes and include test output with changes. Security reporting and a code of
+conduct are not yet documented. No roadmap is committed here.
 
 ## License
 
-MIT.
+[MIT](LICENSE).

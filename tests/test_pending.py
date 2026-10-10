@@ -1,85 +1,65 @@
-# ABOUTME: Unit tests for the server-enforced confirmation token flow.
-# ABOUTME: No network calls — exercises pending.py in isolation.
+"""Exercise the production confirmation function with an isolated store."""
 
-from substack_publisher_mcp.pending import PendingActionStore, require_confirmation
+import pytest
+
+from substack_publisher_mcp import pending
 
 
-def test_first_call_issues_token_and_does_not_confirm():
-    store = PendingActionStore()
-    confirmed, message = _require(store, "delete_draft", {"draft_id": "123"}, None, "delete it")
+@pytest.fixture(autouse=True)
+def isolated_store(monkeypatch):
+    monkeypatch.setattr(pending, "store", pending.PendingActionStore())
+
+
+def issue(tool="delete_draft", args=None):
+    confirmed, message = pending.require_confirmation(
+        tool, args or {"draft_id": "123"}, None, lambda: "delete it"
+    )
     assert not confirmed
     assert "CONFIRMATION REQUIRED" in message
-    assert "confirm_token=" in message
+    assert "delete it" in message
+    return message.split('confirm_token="')[1].split('"')[0]
 
 
-def test_valid_token_confirms_once():
-    store = PendingActionStore()
-    args = {"draft_id": "123"}
-    _, message = _require(store, "delete_draft", args, None, "delete it")
-    token = message.split('confirm_token="')[1].split('"')[0]
-
-    confirmed, _ = _require(store, "delete_draft", args, token, "delete it")
-    assert confirmed
-
-    # token is single-use
-    confirmed_again, message_again = _require(store, "delete_draft", args, token, "delete it")
-    assert not confirmed_again
-    assert "invalid, expired, or already used" in message_again
+def test_valid_token_confirms_once_without_rebuilding_summary():
+    token = issue()
+    def unexpected_summary():
+        pytest.fail("confirmation should not rebuild the summary")
+    assert pending.require_confirmation(
+        "delete_draft", {"draft_id": "123"}, token, unexpected_summary
+    ) == (True, "")
+    assert "invalid, expired, or already used" in pending.require_confirmation(
+        "delete_draft", {"draft_id": "123"}, token, unexpected_summary
+    )[1]
 
 
-def test_token_scoped_to_tool_name():
-    store = PendingActionStore()
-    args = {"draft_id": "123"}
-    _, message = _require(store, "delete_draft", args, None, "delete it")
-    token = message.split('confirm_token="')[1].split('"')[0]
-
-    # a token issued for delete_draft must not confirm publish_draft
-    confirmed, _ = _require(store, "publish_draft", args, token, "publish it")
+@pytest.mark.parametrize("tool,args,expected", [
+    ("publish_draft", {"draft_id": "123"}, "invalid"),
+    ("delete_draft", {"draft_id": "456"}, "don't match"),
+])
+def test_mismatch_rejects_and_consumes_token(tool, args, expected):
+    token = issue()
+    confirmed, message = pending.require_confirmation(tool, args, token, lambda: "unused")
     assert not confirmed
+    assert expected in message
+    assert not pending.require_confirmation(
+        "delete_draft", {"draft_id": "123"}, token, lambda: "unused"
+    )[0]
 
 
-def test_token_scoped_to_arguments():
-    store = PendingActionStore()
-    _, message = _require(store, "delete_draft", {"draft_id": "123"}, None, "delete it")
-    token = message.split('confirm_token="')[1].split('"')[0]
-
-    confirmed, msg = _require(store, "delete_draft", {"draft_id": "456"}, token, "delete it")
-    assert not confirmed
-    assert "don't match" in msg
-
-
-def test_cannot_fabricate_a_token():
-    store = PendingActionStore()
-    confirmed, message = _require(store, "delete_draft", {"draft_id": "123"}, "made-up-token", "delete it")
+def test_fabricated_token_rejected():
+    confirmed, message = pending.require_confirmation(
+        "delete_draft", {"draft_id": "123"}, "made-up-token", lambda: "unused"
+    )
     assert not confirmed
     assert "invalid" in message
 
 
-def _require(store, tool, args, token, summary_text):
-    # Patch the module-level store for this call via monkeypatch-free indirection:
-    # require_confirmation uses the imported `store` singleton, so we call the
-    # store's own methods directly here to keep tests isolated per-instance.
-    if not token:
-        issued = store.create(tool, args, summary_text)
-        return False, (
-            f"CONFIRMATION REQUIRED\n\n{summary_text}\n\n"
-            f'To proceed, call this tool again with confirm_token="{issued}".'
-        )
-    action = store.consume(token, tool)
-    if action is None:
-        return False, "That confirmation token is invalid, expired, or already used."
-    if action.args != args:
-        return False, "The arguments provided don't match the action that was confirmed."
-    return True, ""
-
-
-def test_require_confirmation_function_end_to_end():
-    # Exercises the real public function (and its module-level singleton store)
-    # for a single round trip, independent of the helper above.
-    args = {"draft_id": "999"}
-    confirmed, message = require_confirmation("delete_draft", args, None, lambda: "delete it")
+def test_expired_token_rejected(monkeypatch):
+    token = issue()
+    issued_at = pending.store._actions[token].issued_at
+    monkeypatch.setattr(pending.time, "time", lambda: issued_at + 301)
+    confirmed, message = pending.require_confirmation(
+        "delete_draft", {"draft_id": "123"}, token, lambda: "unused"
+    )
     assert not confirmed
-    token = message.split('confirm_token="')[1].split('"')[0]
-
-    confirmed2, _ = require_confirmation("delete_draft", args, token, lambda: "delete it")
-    assert confirmed2
+    assert "expired" in message

@@ -138,8 +138,9 @@ def get_draft(draft_id: str) -> str:
             text += (
                 f"\n\n[Note: {len(result['unsupported_nodes'])} block(s) in this draft use "
                 "Substack features with no Markdown equivalent (e.g. embeds, polls) and were "
-                "preserved as-is but aren't shown above. update_draft will keep them intact "
-                "unless you pass allow_unsupported_change.]"
+                "represented by preservation markers in the Markdown above. Keep those "
+                "markers unchanged; update_draft refuses missing or altered unsupported "
+                "blocks. This tool does not expose allow_unsupported_change.]"
             )
         return text
     except Exception as e:

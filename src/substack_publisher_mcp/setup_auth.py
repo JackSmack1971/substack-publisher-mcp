@@ -20,8 +20,8 @@ def main() -> None:
 
     print(
         "\nOpen your publication in a browser where you're logged in, open dev tools "
-        "(F12) -> Application/Storage -> Cookies, and copy the full Cookie header value "
-        "for the page (or just the 'substack.sid' cookie's value).\n"
+        "(F12) -> Network, select an authenticated request, and copy its Cookie "
+        "request header value (or use 'substack.sid=<cookie value>').\n"
         "Paste it below. Input is hidden.\n"
     )
     cookies_string = getpass.getpass("Cookie string: ").strip()
