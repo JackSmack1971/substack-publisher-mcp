@@ -58,7 +58,10 @@ def build_client(publication_url: str) -> SubstackApi:
         try:
             return SubstackApi(cookies_string=stored_cookies, publication_url=publication_url)
         except Exception as e:
-            logger.warning(f"Stored cookie string failed ({e}); clearing it")
+            logger.warning(
+                "Stored cookie authentication failed (%s); clearing it",
+                type(e).__name__,
+            )
             clear_stored_cookie_string(publication_url)
 
     email = os.getenv("SUBSTACK_EMAIL")

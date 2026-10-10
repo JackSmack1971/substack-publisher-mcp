@@ -5,7 +5,7 @@ from unittest.mock import Mock
 
 import pytest
 from substack import Api
-from substack.exceptions import DraftConflictError
+from substack.exceptions import DraftConflictError, SubstackAPIException
 
 from substack_publisher_mcp import pending, server
 
@@ -123,12 +123,28 @@ def test_summaries_include_material_mutation_options(client):
     client.publish_draft.assert_not_called()
 
 
+def test_publish_defaults_are_bound_and_preserve_email_behavior(client):
+    mismatched_token = token_from(server.publish_draft("123"))
+
+    assert "don't match" in server.publish_draft(
+        "123", send=False, confirm_token=mismatched_token
+    )
+    client.publish_draft.assert_not_called()
+
+    token = token_from(server.publish_draft("123"))
+    assert "published" in server.publish_draft("123", confirm_token=token)
+    client.publish_draft.assert_called_once_with(
+        "123", send=True, share_automatically=False
+    )
+
+
 def test_update_conflict_requires_new_confirmation_for_override(client):
     kwargs = dict(draft_id="123", markdown="<!-- revision -->\nEdited")
     token = token_from(server.update_draft(**kwargs))
     client.update_draft_from_markdown.side_effect = DraftConflictError("stale revision")
     response = server.update_draft(**kwargs, confirm_token=token)
-    assert "Conflict: stale revision" in response
+    assert "Conflict:" in response
+    assert "stale revision" not in response
     assert "get_draft" in response and "allow_conflict=true" in response
     client.update_draft_from_markdown.assert_called_once_with(
         **kwargs, subtitle=None, allow_conflict=False
@@ -291,3 +307,28 @@ def test_valid_publication_url_preserves_trailing_slash(monkeypatch):
     monkeypatch.setattr(server, "_PUBLICATION_URL", None)
     monkeypatch.setenv("SUBSTACK_PUBLICATION_URL", "https://publication.example/")
     assert server._publication_url() == "https://publication.example/"
+
+
+def test_substack_exception_details_are_not_returned_or_logged(client, caplog):
+    sensitive_detail = "substack.sid=private-cookie response body: private draft"
+    client.get_drafts.side_effect = SubstackAPIException(500, sensitive_detail)
+
+    response = server.list_drafts()
+
+    assert "Substack API request failed" in response
+    assert sensitive_detail not in response
+    assert sensitive_detail not in caplog.text
+
+
+def test_conflict_response_does_not_echo_exception_details(client, caplog):
+    sensitive_detail = "private response body and credential=secret"
+    client.update_draft_from_markdown.side_effect = DraftConflictError(sensitive_detail)
+    kwargs = {"draft_id": "123", "markdown": "edited"}
+    token = token_from(server.update_draft(**kwargs))
+
+    response = server.update_draft(**kwargs, confirm_token=token)
+
+    assert "Conflict:" in response
+    assert "get_draft" in response
+    assert sensitive_detail not in response
+    assert sensitive_detail not in caplog.text

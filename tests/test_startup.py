@@ -26,6 +26,23 @@ async def test_installed_server_initializes_and_lists_tools():
                     "publish_draft", "schedule_draft", "unschedule_draft",
                     "delete_draft", "add_tags",
                 }
+                assert len(tools.tools) == 12
                 schemas = {tool.name: tool.input_schema for tool in tools.tools}
                 assert "allow_conflict" in schemas["update_draft"]["properties"]
                 assert "confirm_token" in schemas["publish_draft"]["properties"]
+                mutating_tools = {
+                    "create_draft", "update_draft", "publish_draft",
+                    "schedule_draft", "unschedule_draft", "delete_draft",
+                    "add_tags",
+                }
+                for name in mutating_tools:
+                    assert "confirm_token" in schemas[name]["properties"]
+                    assert "confirm_token" not in schemas[name].get("required", [])
+                assert set(schemas["create_draft"]["required"]) == {"title", "markdown"}
+                assert set(schemas["publish_draft"]["required"]) == {"draft_id"}
+                assert set(schemas["schedule_draft"]["required"]) == {
+                    "draft_id", "publish_at_iso"
+                }
+                assert {"send", "share_automatically"} <= set(
+                    schemas["publish_draft"]["properties"]
+                )

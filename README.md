@@ -159,7 +159,10 @@ Confirmation tests call the production function with a fresh store per test.
 Mocked tool tests verify no mutation before confirmation, exact argument
 forwarding, replay/mismatch rejection, and conflict override confirmation.
 The stdio smoke test checks the actual installed CLI and dependency integration.
-There is no CI workflow, lint command, or typecheck command in this repository.
+CI is configured to run the locked test suite on Python 3.11 using GitHub-hosted
+Linux and Windows runners. GitHub runner execution and current live Substack
+compatibility remain unverified in this release-candidate check. There is no lint
+or typecheck command in this repository.
 
 ## Troubleshooting
 

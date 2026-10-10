@@ -133,22 +133,35 @@ def _client_or_raise() -> SubstackApi:
         try:
             _client = build_client(_publication_url())
         except AuthError as e:
-            raise RuntimeError(f"Authentication error: {e}") from e
+            logger.error("Substack authentication failed (%s)", type(e).__name__)
+            raise RuntimeError(
+                "Substack authentication failed. Check the configured credentials and publication URL."
+            ) from None
+        except Exception as e:
+            logger.error("Substack client initialization failed (%s)", type(e).__name__)
+            raise RuntimeError(
+                "Substack client initialization failed. Check the configured credentials and publication URL."
+            ) from None
     return _client
 
 
 def _friendly(prefix: str, e: Exception) -> str:
-    logger.error(f"{prefix}: {e}")
+    # Third-party exception text can contain cookies, response bodies, or other
+    # account data. Keep diagnostics useful without copying that text to logs or
+    # MCP tool results.
+    logger.error("%s (%s)", prefix, type(e).__name__)
     if isinstance(e, DraftConflictError):
         return (
-            f"Conflict: {e}\n\nThe draft changed on Substack since it was last fetched. "
+            "Conflict: the draft changed on Substack since it was last fetched. "
             "Call get_draft again to get the current content and revision marker, "
             "reapply your edits, and try again — or pass allow_conflict=true to "
             "overwrite anyway."
         )
     if isinstance(e, SubstackAPIException):
-        return f"Substack API error: {e}"
-    return f"Error: {prefix}: {e}"
+        return "Substack API request failed. Check the publication and authentication, then retry."
+    if isinstance(e, _SectionNotFoundError):
+        return str(e)
+    return f"Error: {prefix}. See server logs for the exception type."
 
 
 # ---- read-only tools -------------------------------------------------
@@ -246,12 +259,18 @@ def get_subscriber_count() -> str:
         return _friendly("failed to get subscriber count", e)
 
 
+class _SectionNotFoundError(ValueError):
+    """A locally generated validation error safe to show to the caller."""
+
+
 def _resolve_section_id(client: SubstackApi, section_name: str) -> int:
     sections = client.get_sections() or []
     for s in sections:
         if s.get("name", "").strip().lower() == section_name.strip().lower():
             return s.get("id")
-    raise ValueError(f"No section named '{section_name}' found. Call get_sections to see valid names.")
+    raise _SectionNotFoundError(
+        f"No section named '{section_name}' found. Call get_sections to see valid names."
+    )
 
 
 # ---- confirmation-gated tools -------------------------------------------------
