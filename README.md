@@ -67,16 +67,17 @@ separate Markdown converter.
 
 ### Confirmation
 
-`create_draft`, `update_draft`, `publish_draft`, `schedule_draft`, and `delete_draft`
-require two calls. First omit `confirm_token`, show the returned summary to the
+Every remote mutation—`create_draft`, `update_draft`, `publish_draft`,
+`schedule_draft`, `unschedule_draft`, `delete_draft`, and `add_tags`—requires two
+calls. First omit `confirm_token`, show the returned summary to the
 user, and obtain explicit approval. Then repeat the same arguments with the
 returned token. Tokens are scoped to the tool and arguments, single-use, expire
 after five minutes, and live only in this server process. Restarting loses them.
 A failed validation or API attempt consumes the token; start again for a retry.
 
 This enforces a second call with a valid token. It cannot prove that a client
-actually asked a human for approval. `unschedule_draft` and `add_tags` mutate
-remote state without this confirmation gate.
+actually asked a human for approval; the caller can request and return the token
+without human consent.
 
 ### Editing safely
 

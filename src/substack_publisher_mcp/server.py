@@ -31,8 +31,9 @@ mcp = MCPServer(
     instructions=(
         "Tools for creating, editing, and publishing Substack posts. Content is "
         "authored in Markdown (CommonMark), which renders as real formatting on "
-        "Substack, not literal markdown syntax. Destructive actions "
-        "(create_draft, update_draft, publish_draft, schedule_draft, delete_draft) "
+        "Substack, not literal markdown syntax. All remote mutations "
+        "(create_draft, update_draft, publish_draft, schedule_draft, "
+        "unschedule_draft, delete_draft, add_tags) "
         "require a two-step confirmation: call once without confirm_token to see "
         "a summary and receive a token, show that summary to the user, then call "
         "again with the token only after the user confirms."
@@ -356,9 +357,24 @@ def schedule_draft(draft_id: str, publish_at_iso: str, confirm_token: Optional[s
         return _friendly(f"failed to schedule draft {draft_id}", e)
 
 
-@mcp.tool(description="Cancel a pending scheduled publish for a draft.")
-def unschedule_draft(draft_id: str) -> str:
+@mcp.tool(
+    description=(
+        "Cancel a pending scheduled publish for a draft. Requires confirmation "
+        "(leave confirm_token empty on the first call)."
+    )
+)
+def unschedule_draft(draft_id: str, confirm_token: Optional[str] = None) -> str:
     client = _client_or_raise()
+    confirm_args: Dict[str, Any] = {"draft_id": draft_id}
+    confirmed, message = require_confirmation(
+        "unschedule_draft",
+        confirm_args,
+        confirm_token,
+        lambda: f"Cancel the scheduled publish for draft {draft_id}.",
+    )
+    if not confirmed:
+        return message
+
     try:
         client.unschedule_draft(draft_id)
         return f"Schedule cancelled for draft {draft_id}."
@@ -395,9 +411,24 @@ def delete_draft(draft_id: str, confirm_token: Optional[str] = None) -> str:
         return _friendly(f"failed to delete draft {draft_id}", e)
 
 
-@mcp.tool(description="Add one or more tags to a post (draft or published).")
-def add_tags(post_id: str, tags: List[str]) -> str:
+@mcp.tool(
+    description=(
+        "Add one or more tags to a post (draft or published). Requires "
+        "confirmation (leave confirm_token empty on the first call)."
+    )
+)
+def add_tags(post_id: str, tags: List[str], confirm_token: Optional[str] = None) -> str:
     client = _client_or_raise()
+    confirm_args: Dict[str, Any] = {"post_id": post_id, "tags": tags}
+    confirmed, message = require_confirmation(
+        "add_tags",
+        confirm_args,
+        confirm_token,
+        lambda: f"Add these tags to post {post_id}: {', '.join(tags)}",
+    )
+    if not confirmed:
+        return message
+
     try:
         client.add_tags_to_post(post_id, tags)
         return f"Tags added to post {post_id}: {', '.join(tags)}"
