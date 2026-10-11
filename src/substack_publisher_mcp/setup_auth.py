@@ -41,6 +41,28 @@ def _has_authenticated_profile(profile: object) -> bool:
     return isinstance(profile_id, int) and not isinstance(profile_id, bool) and profile_id > 0
 
 
+def _has_publication_membership(profile: object, publication_host: str) -> bool:
+    """Require the authenticated profile to identify the requested publication."""
+    if not isinstance(profile, dict):
+        return False
+    memberships = profile.get("publicationUsers")
+    if not isinstance(memberships, list):
+        return False
+    expected_subdomain = publication_host.removesuffix(".substack.com")
+    for membership in memberships:
+        if not isinstance(membership, dict):
+            continue
+        publication = membership.get("publication")
+        if not isinstance(publication, dict):
+            continue
+        if (
+            publication.get("subdomain") == expected_subdomain
+            or publication.get("custom_domain") == publication_host
+        ):
+            return True
+    return False
+
+
 def _diagnostic(
     exc: Exception,
     status: int | None,
@@ -66,6 +88,12 @@ def _diagnostic(
         if host in safe_hosts and path in safe_paths
         else ""
     )
+    if getattr(exc, "redirect_contract_unverified", False):
+        return (
+            f"Substack returned HTTP 303{location}; the complete redirect URL does "
+            "not match the verified destination contract. Missing evidence: the "
+            "redirect query contract. No redirect was followed and no cookie was stored."
+        )
     if status in {301, 302, 303, 307, 308}:
         return (
             f"Authentication check was redirected{location} (HTTP {status}; "
@@ -126,6 +154,8 @@ def main() -> None:
             profile = client.get_user_profile()
             if not _has_authenticated_profile(profile):
                 raise ValueError("unexpected profile response")
+            if not _has_publication_membership(profile, "brettousignant.substack.com"):
+                raise ValueError("publication association mismatch")
     except Exception as exc:
         session = getattr(client, "_session", None)
         status = getattr(exc, "http_status", None) or getattr(session, "current_status", None)
@@ -179,26 +209,37 @@ def diagnose_redirect() -> None:
     try:
         # Api construction performs its bounded profile and publication sign-in
         # requests. Deliberately do not call get_user_profile() here.
-        with restricted_client(canonical_url, cookies_string) as client:
+        with restricted_client(
+            canonical_url, cookies_string, follow_observed_redirect=False,
+        ) as client:
             statuses = list(getattr(getattr(client, "_session", None), "statuses", []))
     except Exception as exc:
         status = getattr(exc, "http_status", None)
         if isinstance(exc, BoundaryError):
             status = status or exc.http_status
             if status is not None:
-                line = f"HTTP {status}"
                 host, path = exc.redirect_host, exc.redirect_path
                 if host and path:
-                    line += f"; redirect destination {host}{path}"
-                print(line)
+                    print(f"Redirect destination: {host}{path}")
+                else:
+                    print("Redirect destination: unavailable")
+                print(f"HTTP status: {status}")
+                print(f"Query present: {'YES' if exc.redirect_query_present else 'NO'}")
+                print(f"Fragment present: {'YES' if exc.redirect_fragment_present else 'NO'}")
+                print(
+                    "Exact allowlist match: "
+                    f"{'YES' if exc.redirect_matches_allowlist else 'NO'}"
+                )
+                print(f"Request count: {exc.request_count or 0}")
                 return
         status = status or getattr(getattr(exc, "response", None), "status_code", None)
         print(f"HTTP {status}" if status is not None else "Diagnostic failed without a response status.")
         return
     if statuses:
-        print("HTTP " + ", HTTP ".join(str(status) for status in statuses))
+        print("HTTP status: " + ", ".join(str(status) for status in statuses))
     else:
         print("Diagnostic completed; no response status was recorded.")
+    print(f"Request count: {len(statuses)}")
 
 
 if __name__ == "__main__":

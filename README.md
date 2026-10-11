@@ -1,7 +1,9 @@
 # Substack Publisher MCP
 
 An unofficial MCP server for authors who want to create, edit, and publish
-Substack posts from an MCP client using Markdown and a two-step confirmation flow.
+Substack posts from an MCP client using Markdown and a two-step execution gate.
+The gate does not establish human approval; the MCP host must present and
+enforce its own approval UI before sending the confirmed call.
 It wraps `python-substack`, which uses Substack's internal endpoints and can break
 when those endpoints change. This project is not affiliated with Substack Inc.
 
@@ -87,12 +89,18 @@ Every remote mutation—`create_draft`, `update_draft`, `publish_draft`,
 calls. First omit `confirm_token`, show the returned summary to the
 user, and obtain explicit approval. Then repeat the same arguments with the
 returned token. Tokens are scoped to the tool and arguments, single-use, expire
-after five minutes, and live only in this server process. Restarting loses them.
+after five minutes, and live only in this server process. At most 100 actions
+may await approval; expired tokens are collected and new requests are refused
+while the store is full. Restarting loses pending tokens.
 A failed validation or API attempt consumes the token; start again for a retry.
 
 This enforces a second call with a valid token. It cannot prove that a client
 actually asked a human for approval; the caller can request and return the token
-without human consent.
+without human consent. The token only prevents replay and argument substitution.
+The host must show the action details in its approval UI and require a user
+decision; tool descriptions and annotations are not authorization controls.
+This server has no authenticated human identity or separate approval channel.
+Supported host products and their approval behavior have not been qualified.
 
 ### Editing safely
 
@@ -120,6 +128,28 @@ possible. No credentials are needed just to start the server or list its tools.
 | `SUBSTACK_COOKIES_STRING` | Optional, first preference | Cookie header string; bypasses keyring lookup |
 | OS keyring | Optional, second preference | Cookie saved by setup for the exact publication URL |
 | `SUBSTACK_EMAIL`, `SUBSTACK_PASSWORD` | Optional, final fallback | Both required; login may encounter CAPTCHA |
+
+The publication hostname must match a publication returned for the authenticated
+Substack account. The locked upstream client checks this against the account's
+publication list before selecting its publication endpoint; account-owned custom
+domains are supported. An unknown hostname fails before a request is sent to it.
+The production session rejects non-HTTPS destinations, nonstandard ports, and
+redirect hosts outside Substack or account publications returned by the
+authenticated profile. Only the configured publication host is added to the
+session allowlist after the profile confirms it.
+
+Tool inputs have server-side and generated-schema bounds: title 300 characters,
+subtitle 500, Markdown 200,000, section name 120, object ID 64 path-safe
+characters, up to 100 tags of 128 characters each, schedule datetime 64, and
+confirmation token 64. Lists remain capped at 25 upstream items. `get_draft`
+refuses a Markdown response over 200,000 characters instead of truncating the
+content or revision markers. Upstream requests use a 5 second connect timeout
+and 10 second read timeout. Only bounded GET retries are enabled; DELETE, POST,
+and PUT are not automatically retried.
+
+These input bounds are a breaking MCP contract change in version 0.2.0. Update
+clients that send values outside them before upgrading. Split tag additions
+over 100 into multiple `add_tags` calls; each call needs a separate confirmation.
 
 ## Architecture and directory structure
 

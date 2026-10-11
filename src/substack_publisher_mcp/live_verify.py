@@ -36,13 +36,23 @@ class BoundaryError(Exception):
 
     def __init__(self, message: str, *, http_status: int | None = None,
                  host: str | None = None, path: str | None = None,
-                 redirect_host: str | None = None, redirect_path: str | None = None):
+                 redirect_host: str | None = None, redirect_path: str | None = None,
+                 redirect_contract_unverified: bool = False,
+                 redirect_query_present: bool = False,
+                 redirect_fragment_present: bool = False,
+                 redirect_matches_allowlist: bool = False,
+                 request_count: int | None = None):
         super().__init__(message)
         self.http_status = http_status
         self.host = host
         self.path = path
         self.redirect_host = redirect_host
         self.redirect_path = redirect_path
+        self.redirect_contract_unverified = redirect_contract_unverified
+        self.redirect_query_present = redirect_query_present
+        self.redirect_fragment_present = redirect_fragment_present
+        self.redirect_matches_allowlist = redirect_matches_allowlist
+        self.request_count = request_count
 
 
 class SubstackCookieJar(requests.cookies.RequestsCookieJar):
@@ -67,11 +77,13 @@ class RestrictedSession(requests.Session):
         self.cookies = SubstackCookieJar()
         self.trust_env = False
         self.publication_host = publication_host
+        self.follow_observed_redirect = True
         self.operations = 0
         self.statuses: list[int] = []
         self.current_status: int | None = None
         self.current_host: str | None = None
         self.current_path: str | None = None
+        self._observed_redirect_pending: str | None = None
         self.mount("https://", HTTPAdapter(max_retries=0))
         self.mount("http://", HTTPAdapter(max_retries=0))
 
@@ -104,6 +116,13 @@ class RestrictedSession(requests.Session):
             return False
         if host != self.publication_host:
             return False
+        if (
+            self.publication_host == "brettousignant.substack.com"
+            and path == "/"
+            and not parsed.query
+            and not parsed.fragment
+        ):
+            return url == self._observed_redirect_pending
         if path == "/api/v1/subscriptions":
             return not parsed.query
         query = parse_qs(parsed.query)
@@ -138,26 +157,29 @@ class RestrictedSession(requests.Session):
             raise RequestException(safe_error) from None
         self.statuses.append(response.status_code)
         if 300 <= response.status_code < 400:
-            redirect_host = redirect_path = None
+            redirect_contract_unverified = False
+            # Live diagnostic evidence establishes this one transition's
+            # destination host and root path. Until its query contract is
+            # observed, only a query-free absolute Location is admissible.
+            if (
+                response.status_code == 303
+                and self.publication_host == "brettousignant.substack.com"
+                and self._is_observed_signin(url)
+            ):
+                location = response.headers.get("Location")
+                target_url = self._observed_redirect_target(location)
+                if target_url is not None and self.follow_observed_redirect:
+                    response.close()
+                    self._observed_redirect_pending = target_url
+                    try:
+                        return self.request("GET", target_url, *args, **kwargs)
+                    finally:
+                        self._observed_redirect_pending = None
+                redirect_contract_unverified = True
             location = response.headers.get("Location")
-            if location:
-                try:
-                    target = urlsplit(urljoin(response.url or url, location))
-                    host = target.hostname
-                    path = target.path or "/"
-                    valid_host = bool(host) and all(
-                        re.fullmatch(r"[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?", label)
-                        for label in host.rstrip(".").split(".")
-                    )
-                    if (
-                        target.scheme == "https" and valid_host and not target.username
-                        and not target.password and target.port in (None, 443)
-                        and all(0x21 <= ord(char) <= 0x7E and char != "\\" for char in path)
-                    ):
-                        redirect_host = host.lower().rstrip(".")
-                        redirect_path = path
-                except (ValueError, TypeError):
-                    pass
+            redirect_host, redirect_path, query_present, fragment_present, matches = (
+                self._redirect_evidence(location, response.url or url)
+            )
             response.close()
             raise BoundaryError(
                 "redirect rejected by read-only qualification boundary",
@@ -166,8 +188,81 @@ class RestrictedSession(requests.Session):
                 path=self.current_path,
                 redirect_host=redirect_host,
                 redirect_path=redirect_path,
+                redirect_contract_unverified=redirect_contract_unverified,
+                redirect_query_present=query_present,
+                redirect_fragment_present=fragment_present,
+                redirect_matches_allowlist=matches,
+                request_count=self.operations,
             )
         return response
+
+    @staticmethod
+    def _is_observed_signin(url: str) -> bool:
+        try:
+            parsed = urlsplit(url)
+            return (
+                parsed.scheme == "https"
+                and parsed.netloc == "substack.com"
+                and parsed.path == "/sign-in"
+                and parsed.query == "redirect=%2F&for_pub=brettousignant"
+                and not parsed.fragment
+            )
+        except (ValueError, TypeError):
+            return False
+
+    @staticmethod
+    def _observed_redirect_target(location: str | None) -> str | None:
+        """Validate the complete observed destination before dispatch."""
+        if not location or any(ord(char) < 0x21 or ord(char) > 0x7E for char in location):
+            return None
+        try:
+            target = urlsplit(location)
+            return location if (
+                target.scheme == "https"
+                and target.netloc == "brettousignant.substack.com"
+                and target.hostname == "brettousignant.substack.com"
+                and target.path == "/"
+                and not target.query
+                and not target.fragment
+                and "?" not in location
+                and "#" not in location
+                and not target.username
+                and not target.password
+                and target.port is None
+            ) else None
+        except (ValueError, TypeError):
+            return None
+
+    @classmethod
+    def _redirect_evidence(
+        cls, location: str | None, base_url: str,
+    ) -> tuple[str | None, str | None, bool, bool, bool]:
+        """Return sanitized redirect facts without retaining URL components."""
+        if not location:
+            return None, None, False, False, False
+        try:
+            target = urlsplit(urljoin(base_url, location))
+            host = target.hostname
+            path = target.path or "/"
+            valid_host = bool(host) and all(
+                re.fullmatch(r"[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?", label)
+                for label in host.rstrip(".").split(".")
+            )
+            safe_destination = (
+                target.scheme == "https" and valid_host and not target.username
+                and not target.password and target.port in (None, 443)
+                and all(0x21 <= ord(char) <= 0x7E and char != "\\" for char in path)
+            )
+            return (
+                host.lower().rstrip(".") if safe_destination else None,
+                path if safe_destination else None,
+                "?" in location.split("#", 1)[0], "#" in location,
+                cls._observed_redirect_target(location) is not None,
+            )
+        except (ValueError, TypeError):
+            # If parsing fails, report delimiter presence conservatively and
+            # never expose a destination or treat it as allowlisted.
+            return None, None, "?" in location, "#" in location, False
 
     def send(self, request, **kwargs):
         # Guard the actual transport boundary too, including any SDK code that
@@ -217,10 +312,13 @@ def _publication(publication_url: str) -> tuple[str, str]:
 
 
 @contextmanager
-def restricted_client(publication_url: str, cookies: str):
+def restricted_client(
+    publication_url: str, cookies: str, *, follow_observed_redirect: bool = True,
+):
     """Construct a Substack client entirely inside the qualification boundary."""
     host, canonical_url = _publication(publication_url)
     session = RestrictedSession(host)
+    session.follow_observed_redirect = follow_observed_redirect
     original_factory = requests.Session
     try:
         # Api sends requests during construction. Keep those requests within

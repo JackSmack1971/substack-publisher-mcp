@@ -97,3 +97,39 @@ def test_concurrent_replay_confirms_at_most_once():
         results = list(executor.map(lambda _: consume(), range(2)))
 
     assert sum(confirmed for confirmed, _ in results) == 1
+
+
+def test_pending_action_store_has_a_hard_capacity_limit():
+    for _ in range(pending._MAX_PENDING_ACTIONS):
+        confirmed, _ = pending.require_confirmation(
+            "delete_draft", {"draft_id": "123"}, None, lambda: "delete it"
+        )
+        assert not confirmed
+
+    confirmed, message = pending.require_confirmation(
+        "delete_draft", {"draft_id": "123"}, None, lambda: "delete it"
+    )
+
+    assert not confirmed
+    assert "Too many actions" in message
+    assert len(pending.store._actions) == pending._MAX_PENDING_ACTIONS
+
+
+def test_concurrent_creation_cannot_exceed_pending_action_capacity():
+    for _ in range(pending._MAX_PENDING_ACTIONS - 1):
+        issue()
+
+    barrier = Barrier(2)
+
+    def create():
+        barrier.wait()
+        return pending.require_confirmation(
+            "delete_draft", {"draft_id": "123"}, None, lambda: "delete it"
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(lambda _: create(), range(2)))
+
+    assert len(pending.store._actions) == pending._MAX_PENDING_ACTIONS
+    assert sum("CONFIRMATION REQUIRED" in message for _, message in results) == 1
+    assert sum("Too many actions" in message for _, message in results) == 1

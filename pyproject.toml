@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "substack-publisher-mcp"
-version = "0.1.0"
+version = "0.2.0"
 description = "Unofficial MCP server for Substack, built directly on python-substack's markdown-native API (not affiliated with Substack Inc.)"
 readme = "README.md"
 requires-python = ">=3.10"

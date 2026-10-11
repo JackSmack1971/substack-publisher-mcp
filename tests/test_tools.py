@@ -106,8 +106,8 @@ def test_summaries_include_material_mutation_options(client):
     create = server.create_draft(
         "Title", "body", tags=["news"], section_name="Updates"
     )
-    assert "Tags: news" in create
-    assert "Section: Updates" in create
+    assert 'Tags: ["news"]' in create
+    assert 'Section (untrusted): "Updates"' in create
 
     update = server.update_draft(
         "123", "replacement", subtitle="New subtitle", allow_conflict=True
@@ -184,7 +184,7 @@ def test_other_argument_forwarding(client, tool, kwargs, method, args, expected)
 
 
 @pytest.mark.parametrize("tool", [server.list_drafts, server.list_published])
-@pytest.mark.parametrize("limit", [0, -1, 1.5, "2", True])
+@pytest.mark.parametrize("limit", [0, -1, 1.5, "2", True, server.MAX_LIST_LIMIT + 1])
 def test_invalid_list_limits_stop_before_api(client, tool, limit):
     assert "positive integer" in tool(limit=limit)
     client.get_drafts.assert_not_called()
@@ -218,6 +218,44 @@ def test_invalid_create_inputs_never_issue_confirmation_or_mutate(client, kwargs
     assert "CONFIRMATION REQUIRED" not in result
     assert "must" in result or "Each tag" in result
     client.create_draft_from_markdown.assert_not_called()
+
+
+@pytest.mark.parametrize("kwargs", [
+    {"title": "x" * (server.MAX_TITLE_LENGTH + 1), "markdown": "body"},
+    {"title": "Title", "markdown": "x" * (server.MAX_MARKDOWN_LENGTH + 1)},
+    {"title": "Title", "markdown": "body", "subtitle": "x" * (server.MAX_SUBTITLE_LENGTH + 1)},
+    {"title": "Title", "markdown": "body", "tags": ["ok"] * (server.MAX_TAG_COUNT + 1)},
+    {"title": "Title", "markdown": "body", "tags": ["x" * (server.MAX_TAG_LENGTH + 1)]},
+    {"title": "Title", "markdown": "body", "section_name": "x" * (server.MAX_SECTION_NAME_LENGTH + 1)},
+])
+def test_oversized_create_inputs_rejected_before_confirmation_or_api(client, kwargs):
+    result = server.create_draft(**kwargs)
+    assert "CONFIRMATION REQUIRED" not in result
+    assert "must" in result
+    client.create_draft_from_markdown.assert_not_called()
+
+
+def test_oversized_update_body_rejected_before_confirmation_or_api(client):
+    result = server.update_draft("123", "x" * (server.MAX_MARKDOWN_LENGTH + 1))
+    assert "at most" in result
+    assert "CONFIRMATION REQUIRED" not in result
+    client.update_draft_from_markdown.assert_not_called()
+
+
+def test_path_unsafe_and_oversized_ids_are_rejected(client):
+    for draft_id in ("../123", "123?x=y", "x" * (server.MAX_ID_LENGTH + 1)):
+        assert "draft_id must" in server.get_draft(draft_id)
+    client.export_draft_to_markdown.assert_not_called()
+
+
+def test_oversized_draft_response_is_refused_without_truncation(client):
+    client.export_draft_to_markdown.return_value = {
+        "draft": {"id": "123"},
+        "markdown": "x" * (server.MAX_MARKDOWN_LENGTH + 1),
+    }
+    result = server.get_draft("123")
+    assert "was not returned" in result
+    assert len(result) < 200
 
 
 def test_unknown_section_is_rejected_before_confirmation_or_mutation(client):
@@ -284,6 +322,14 @@ def test_add_tags_does_not_impose_an_undocumented_count_limit(client):
     token = token_from(server.add_tags("123", tags))
     assert "Tags added" in server.add_tags("123", tags, confirm_token=token)
     client.add_tags_to_post.assert_called_once_with("123", tags)
+
+
+def test_add_tags_enforces_documented_maximum(client):
+    tags = [f"tag-{index}" for index in range(server.MAX_TAG_COUNT + 1)]
+    result = server.add_tags("123", tags)
+    assert "at most" in result
+    assert "CONFIRMATION REQUIRED" not in result
+    client.add_tags_to_post.assert_not_called()
 
 
 @pytest.mark.parametrize("url", [

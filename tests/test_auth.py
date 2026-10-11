@@ -4,9 +4,152 @@ from contextlib import contextmanager
 import json
 import requests
 import pytest
+from requests.adapters import HTTPAdapter, Retry
 from urllib.parse import urlsplit
 
 from substack_publisher_mcp import auth, live_verify, server, setup_auth
+
+
+def test_live_client_uses_finite_timeouts_and_bounded_get_only_retries(
+    monkeypatch,
+):
+    monkeypatch.setenv("SUBSTACK_COOKIES_STRING", "substack.sid=synthetic")
+    monkeypatch.delenv("SUBSTACK_EMAIL", raising=False)
+    monkeypatch.delenv("SUBSTACK_PASSWORD", raising=False)
+
+    class Session:
+        def __init__(self):
+            retry = Retry(
+                total=4,
+                status=4,
+                backoff_factor=1,
+                status_forcelist=(429,),
+                allowed_methods=frozenset({"GET", "DELETE"}),
+                respect_retry_after_header=True,
+            )
+            self.adapters = {"https://": HTTPAdapter(max_retries=retry)}
+            self.call = None
+
+        def request(self, *args, **kwargs):
+            self.call = (args, kwargs)
+            return object()
+
+    class Client:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+            self.timeout = kwargs["timeout"]
+            self._session = Session()
+
+    monkeypatch.setattr(auth, "SubstackApi", Client)
+    client = auth.build_client("https://publication.example")
+
+    assert client.kwargs["timeout"] == (auth.CONNECT_TIMEOUT_SECONDS, auth.READ_TIMEOUT_SECONDS)
+    client._session.request("GET", "https://substack.com/api/v1/profile")
+    assert client._session.call[1]["timeout"] == (5, 10)
+    retry = client._session.adapters["https://"].max_retries
+    assert retry.allowed_methods == frozenset({"GET"})
+    assert retry.respect_retry_after_header is False
+    assert retry.total == 4
+    assert retry.backoff_factor == 0.25
+
+
+def test_cookie_scope_is_rechecked_on_each_send_and_rejects_downgrades(monkeypatch):
+    sent = []
+
+    def fake_send(_adapter, prepared, **_kwargs):
+        sent.append((prepared.url, prepared.headers.get("Cookie", "")))
+        response = requests.Response()
+        response.status_code = 200
+        response.url = prepared.url
+        response._content = json.dumps({"publicationUsers": [
+            {"publication": {"custom_domain": "publication.example", "subdomain": "publication"}},
+            {"publication": {"custom_domain": "other.example", "subdomain": "other"}},
+        ]}).encode()
+        response._content_consumed = True
+        return response
+
+    monkeypatch.setattr(requests.adapters.HTTPAdapter, "send", fake_send)
+    session = auth.CookieScopedSession("publication.example")
+
+    def prepare(url):
+        request = requests.Request("GET", url, headers={"Cookie": "substack.sid=synthetic"})
+        return session.prepare_request(request)
+
+    # Authenticated profile response adds only its declared publication hosts.
+    session.send(prepare("https://substack.com/api/v1/user/profile/self"))
+    session.send(prepare("https://publication.example/sign-in"))
+    assert all("substack.sid=synthetic" in cookie for _, cookie in sent)
+
+    for destination in (
+        "http://substack.com/collect",
+        "https://substack.com:8443/collect",
+        "https://attacker.example/collect",
+        "https://other.example/collect",
+    ):
+        with pytest.raises(requests.exceptions.InvalidURL):
+            session.send(prepare(destination))
+
+    assert len(sent) == 2  # Blocked redirect hops never reach the adapter.
+
+
+def test_cookie_scoped_session_blocks_real_off_host_redirect_hop(monkeypatch):
+    sent = []
+
+    def redirect_to_untrusted_host(_adapter, prepared, **_kwargs):
+        sent.append((prepared.url, prepared.headers.get("Cookie", "")))
+        response = requests.Response()
+        response.status_code = 302
+        response.headers["Location"] = "https://attacker.example/collect"
+        response.url = prepared.url
+        response.request = prepared
+        response._content = b""
+        response._content_consumed = True
+        return response
+
+    monkeypatch.setattr(requests.adapters.HTTPAdapter, "send", redirect_to_untrusted_host)
+    session = auth.CookieScopedSession()
+    session.cookies.set("substack.sid", "synthetic")
+
+    with pytest.raises(requests.exceptions.InvalidURL, match="unverified redirect host"):
+        session.get("https://substack.com/api/v1/user/profile/self")
+
+    assert len(sent) == 1
+    assert sent[0][0] == "https://substack.com/api/v1/user/profile/self"
+    assert "substack.sid=synthetic" in sent[0][1]
+
+
+def test_locked_client_constructor_uses_selected_publication_cookie_scope(monkeypatch):
+    sent = []
+
+    def fake_send(_adapter, prepared, **_kwargs):
+        sent.append((prepared.url, prepared.headers.get("Cookie", "")))
+        response = requests.Response()
+        response.status_code = 200
+        response.url = prepared.url
+        response.request = prepared
+        if prepared.url.endswith("/user/profile/self"):
+            response._content = json.dumps({"id": 44, "publicationUsers": [
+                {"publication": {"id": 1, "subdomain": "selected", "custom_domain": "selected.example"}},
+                {"publication": {"id": 2, "subdomain": "other", "custom_domain": "other.example"}},
+            ]}).encode()
+        else:
+            response._content = b"{}"
+        response._content_consumed = True
+        return response
+
+    monkeypatch.setattr(requests.adapters.HTTPAdapter, "send", fake_send)
+    client = auth._build_cookie_scoped_client(
+        cookies_string="substack.sid=synthetic",
+        publication_url="https://selected.example",
+    )
+
+    assert isinstance(client._session, auth.CookieScopedSession)
+    assert [urlsplit(url).hostname for url, _ in sent] == [
+        "substack.com", "substack.com",
+    ]
+    assert all("substack.sid=synthetic" in cookie for _, cookie in sent)
+    with pytest.raises(requests.exceptions.InvalidURL, match="unverified redirect host"):
+        client._session.get("https://other.example/collect")
 
 
 def test_stored_cookie_failure_is_cleared_without_logging_exception_details(
@@ -52,6 +195,21 @@ def test_client_initialization_failure_is_generic_and_not_logged(
     assert "private profile" not in caplog.text
 
 
+def test_top_level_runtime_error_logs_only_exception_type(monkeypatch, caplog):
+    secret = "cookie=private-cookie response body: private draft"
+    monkeypatch.setattr(
+        server.mcp, "run", lambda: (_ for _ in ()).throw(RuntimeError(secret))
+    )
+
+    with pytest.raises(RuntimeError) as raised:
+        server.main()
+
+    assert "RuntimeError" in caplog.text
+    assert secret not in str(raised.value)
+    assert secret not in caplog.text
+    assert "private-cookie" not in caplog.text
+
+
 def test_setup_verification_failure_does_not_print_cookie_or_response_details(
     monkeypatch, capsys
 ):
@@ -89,7 +247,9 @@ def test_setup_uses_restricted_client_and_stores_only_after_profile_validation(
     class Client:
         def get_user_profile(self):
             events.append("validate")
-            return {"id": 41, "name": "Synthetic User"}
+            return {"id": 41, "name": "Synthetic User", "publicationUsers": [{
+                "publication": {"subdomain": "brettousignant"},
+            }]}
 
     @contextmanager
     def restricted_client(url, supplied_cookies):
@@ -269,7 +429,9 @@ def test_setup_initialization_and_profile_use_restricted_session(monkeypatch):
 
         def get_user_profile(self):
             self._session.get("https://substack.com/api/v1/user/profile/self")
-            return {"id": 1}
+            return {"id": 1, "publicationUsers": [{
+                "publication": {"subdomain": "brettousignant"},
+            }]}
 
     def fake_send(_adapter, prepared, **kwargs):
         sent.append((prepared.method, prepared.url, kwargs.get("timeout"), kwargs.get("verify")))
@@ -367,6 +529,137 @@ def test_setup_success_uses_locked_client_then_persists_after_profile_id(
     assert "synthetic-cookie" not in capsys.readouterr().out
 
 
+def test_locked_client_follows_only_observed_303_and_preserves_final_response(monkeypatch):
+    profile = {
+        "id": 44,
+        "publicationUsers": [{"publication": {
+            "subdomain": "brettousignant", "custom_domain": None,
+        }}],
+    }
+    sent = []
+    original_factory = requests.Session
+
+    def fake_send(_adapter, prepared, **_kwargs):
+        sent.append((prepared.url, prepared.headers.get("Cookie")))
+        response = requests.Response()
+        response.url = prepared.url
+        response.request = prepared
+        response.headers["Content-Type"] = "application/json"
+        if prepared.path_url.startswith("/sign-in"):
+            response.status_code = 303
+            response.headers["Location"] = "https://brettousignant.substack.com/"
+            response._content = b""
+        else:
+            response.status_code = 200
+            response._content = json.dumps(profile).encode()
+        response._content_consumed = True
+        return response
+
+    monkeypatch.setattr(requests.adapters.HTTPAdapter, "send", fake_send)
+    with live_verify.restricted_client(
+        "https://brettousignant.substack.com", "substack.sid=synthetic-cookie"
+    ) as client:
+        assert setup_auth._has_authenticated_profile(client.get_user_profile())
+        assert setup_auth._has_publication_membership(
+            client.get_user_profile(), "brettousignant.substack.com"
+        )
+        assert client._session.statuses == [200, 303, 200, 200, 200]
+        assert client._session.operations == 5
+    assert requests.Session is original_factory
+    assert [urlsplit(url).path for url, _ in sent] == [
+        "/api/v1/user/profile/self", "/sign-in", "/", "/api/v1/user/profile/self",
+        "/api/v1/user/profile/self",
+    ]
+    assert all(cookie == "substack.sid=synthetic-cookie" for _, cookie in sent)
+
+
+def test_observed_redirect_loop_is_rejected_without_another_hop(monkeypatch):
+    sent = []
+
+    def fake_send(_adapter, prepared, **_kwargs):
+        sent.append(prepared.url)
+        response = requests.Response()
+        response.url = prepared.url
+        response.request = prepared
+        if prepared.path_url.startswith("/sign-in"):
+            response.status_code = 303
+            response.headers["Location"] = "https://brettousignant.substack.com/"
+            response._content = b""
+        elif prepared.path_url == "/":
+            response.status_code = 303
+            response.headers["Location"] = "https://brettousignant.substack.com/"
+            response._content = b""
+        else:
+            response.status_code = 200
+            response.headers["Content-Type"] = "application/json"
+            response._content = json.dumps({"id": 44, "publicationUsers": [{
+                "publication": {"subdomain": "brettousignant"},
+            }]}).encode()
+        response._content_consumed = True
+        return response
+
+    monkeypatch.setattr(requests.adapters.HTTPAdapter, "send", fake_send)
+    with pytest.raises(live_verify.BoundaryError, match="redirect rejected"):
+        with live_verify.restricted_client(
+            "https://brettousignant.substack.com", "substack.sid=synthetic-cookie"
+        ):
+            pytest.fail("looping redirect must not complete client initialization")
+    assert [urlsplit(url).path for url in sent] == [
+        "/api/v1/user/profile/self", "/sign-in", "/",
+    ]
+
+
+def test_publication_membership_must_match_requested_publication():
+    profile = {"id": 44, "publicationUsers": [{"publication": {
+        "subdomain": "someone-else", "custom_domain": None,
+    }}]}
+    assert not setup_auth._has_publication_membership(
+        profile, "brettousignant.substack.com"
+    )
+
+
+def test_unverified_redirect_contract_diagnostic_names_missing_evidence():
+    error = live_verify.BoundaryError(
+        "redirect rejected", http_status=303,
+        redirect_contract_unverified=True,
+    )
+    message = setup_auth._diagnostic(error, 303)
+    assert "Missing evidence: the redirect query contract" in message
+    assert "No redirect was followed" in message
+    assert "no cookie was stored" in message
+    assert setup_auth._has_publication_membership(
+        {"id": 44, "publicationUsers": [{"publication": {
+            "subdomain": "brettousignant", "custom_domain": None,
+        }}]},
+        "brettousignant.substack.com",
+    )
+
+
+def test_setup_does_not_persist_when_publication_association_is_wrong(
+    monkeypatch, capsys
+):
+    class Client:
+        def get_user_profile(self):
+            return {"id": 44, "publicationUsers": [{"publication": {
+                "subdomain": "different-publication",
+            }}]}
+
+    @contextmanager
+    def restricted_client(*_args):
+        yield Client()
+
+    monkeypatch.setattr("builtins.input", lambda _: "https://brettousignant.substack.com")
+    monkeypatch.setattr(setup_auth.getpass, "getpass", lambda _: "synthetic-cookie")
+    monkeypatch.setattr(setup_auth, "restricted_client", restricted_client)
+    monkeypatch.setattr(
+        setup_auth, "store_cookie_string",
+        lambda *_: pytest.fail("association mismatch must not persist credentials"),
+    )
+    with pytest.raises(SystemExit):
+        setup_auth.main()
+    assert "synthetic-cookie" not in capsys.readouterr().out
+
+
 @pytest.mark.parametrize("entered", [
     "substack.sid=synthetic-value", "synthetic-value",
 ])
@@ -376,7 +669,9 @@ def test_setup_normalizes_cookie_pair_and_only_saves_after_validation(monkeypatc
     class Client:
         def get_user_profile(self):
             events.append("validate")
-            return {"id": 1}
+            return {"id": 1, "publicationUsers": [{
+                "publication": {"subdomain": "brettousignant"},
+            }]}
 
     @contextmanager
     def restricted_client(url, cookie):
@@ -433,7 +728,9 @@ def test_setup_reports_keyring_failure_after_validation_without_cookie(monkeypat
 
     class Client:
         def get_user_profile(self):
-            return {"id": 1}
+            return {"id": 1, "publicationUsers": [{
+                "publication": {"subdomain": "brettousignant"},
+            }]}
 
     @contextmanager
     def restricted_client(*_args):
@@ -450,13 +747,15 @@ def test_setup_reports_keyring_failure_after_validation_without_cookie(monkeypat
     assert secret not in output
 
 
-@pytest.mark.parametrize("location,shown", [
-    ("https://next.substack.com/continue?token=private#secret", "next.substack.com/continue"),
-    ("https://user:password@evil.example/private?token=private", None),
-    ("https://bad host/private?token=private", None),
+@pytest.mark.parametrize("location,shown,query,fragment,matches", [
+    ("https://brettousignant.substack.com/", "brettousignant.substack.com/", "NO", "NO", "YES"),
+    ("https://brettousignant.substack.com/?token=private&secret=value", "brettousignant.substack.com/", "YES", "NO", "NO"),
+    ("https://brettousignant.substack.com/#private-fragment", "brettousignant.substack.com/", "NO", "YES", "NO"),
+    ("https://user:password@evil.example/private?token=private", None, "YES", "NO", "NO"),
+    ("https://bad host/private?token=private", None, "YES", "NO", "NO"),
 ])
 def test_redirect_diagnostic_uses_only_two_locked_client_gets_and_sanitizes_location(
-    monkeypatch, capsys, location, shown
+    monkeypatch, capsys, location, shown, query, fragment, matches
 ):
     monkeypatch.setattr(setup_auth.sys, "argv", ["setup-auth", "--diagnose-redirect"])
     monkeypatch.setattr("builtins.input", lambda _: "https://brettousignant.substack.com")
@@ -506,8 +805,18 @@ def test_redirect_diagnostic_uses_only_two_locked_client_gets_and_sanitizes_loca
     assert all("fresh-synthetic-cookie" not in url for _, url, _, _ in sent)
     assert requests.Session is original_factory
     assert len(closed) == 1
-    assert "HTTP 303" in output
-    assert (shown in output) if shown else ("evil.example" not in output and "invalid" not in output)
+    assert "HTTP status: 303" in output
+    assert (f"Redirect destination: {shown}" in output) if shown else "Redirect destination: unavailable" in output
+    assert f"Query present: {query}" in output
+    assert f"Fragment present: {fragment}" in output
+    assert f"Exact allowlist match: {matches}" in output
+    assert "Request count: 2" in output
+    assert len(sent) == 2  # The destination is evidence only; it is never requested.
+    assert "evil.example" not in output
+    assert "bad host" not in output
+    assert "secret" not in output
+    assert "private" not in output
+    assert "value" not in output
     assert "token=private" not in output
     assert "#secret" not in output
     assert "PRIVATE BODY SECRET" not in output
@@ -546,7 +855,8 @@ def test_redirect_diagnostic_success_closes_session_and_reports_only_statuses(
     output = capsys.readouterr().out
     assert len(sent) == 2
     assert all(request.method == "GET" for request in sent)
-    assert "HTTP 200, HTTP 200" in output
+    assert "HTTP status: 200, 200" in output
+    assert "Request count: 2" in output
     assert "fresh-cookie" not in output
     assert requests.Session is original_factory
     assert len(closed) == 1
