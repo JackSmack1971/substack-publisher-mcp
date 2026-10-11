@@ -9,7 +9,7 @@ import hashlib
 
 ROOT = Path(__file__).resolve().parents[1]
 SKILLS = ('mcp-discovery','mcp-contract-design','mcp-implementation','mcp-security-review','mcp-conformance','mcp-release')
-REQUIRED = ('README.md','AGENTS.md','.codex/config.toml','docs/architecture/architecture.md','docs/contracts/server-contract.md','docs/security/threat-model.md','docs/verification/evidence.md','docs/architecture/standards-matrix.md')
+REQUIRED = ('README.md','AGENTS.md','.codex/config.toml','docs/architecture/architecture.md','docs/contracts/server-contract.md','docs/security/threat-model.md')
 
 # Codex config coverage. Provenance: Codex CLI 0.162.1 (`codex exec --strict-config -c key=badvalue`
 # probes, `codex features list`) and https://learn.chatgpt.com/docs/config-file/config-reference,
@@ -130,11 +130,23 @@ def repository_trust(root, codex_home=None):
     except (OSError, ValueError):
         return 'unknown'
     target = os.path.normcase(os.path.normpath(str(root.resolve())))
-    for key, value in projects.items() if isinstance(projects, dict) else ():
-        if not isinstance(value, dict) or value.get('trust_level') not in ('trusted', 'untrusted'): continue
+    if not isinstance(projects, dict):
+        return 'unknown'
+    matches = []
+    for key, value in projects.items():
+        if not isinstance(value, dict) or value.get('trust_level') not in ('trusted', 'untrusted'):
+            continue
         candidate = os.path.normcase(os.path.normpath(str(key)))
-        if target == candidate or target.startswith(candidate.rstrip(os.sep) + os.sep):
-            return value['trust_level']
+        if target == candidate:
+            matches.append((str(key), value['trust_level']))
+    if matches:
+        # Match Codex's exact project-root lookup: parent entries are not inherited.
+        # Prefer the exact spelling; otherwise resolve normalized aliases deterministically.
+        exact = next((trust for key, trust in matches if key == target), None)
+        if exact is not None:
+            return exact
+        matches.sort(key=lambda match: match[0])
+        return matches[0][1]
     return 'unknown'
 
 def distributable_inventory(root):

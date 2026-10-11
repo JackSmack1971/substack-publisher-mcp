@@ -147,6 +147,10 @@ content or revision markers. Upstream requests use a 5 second connect timeout
 and 10 second read timeout. Only bounded GET retries are enabled; DELETE, POST,
 and PUT are not automatically retried.
 
+These input bounds are a breaking MCP contract change in version 0.2.0. Update
+clients that send values outside them before upgrading. Split tag additions
+over 100 into multiple `add_tags` calls; each call needs a separate confirmation.
+
 ## Architecture and directory structure
 
 The MCP client calls `server.py`, which validates confirmation through `pending.py`

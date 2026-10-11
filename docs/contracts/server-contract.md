@@ -17,6 +17,17 @@ or OAuth resource server is provided.
 - **UNRESOLVED:** The README documents generic MCP client configuration but
   does not name supported host versions or establish their consent UI behavior.
 
+### Breaking input change in 0.2.0
+
+Version 0.2.0 narrows previously accepted tool inputs to the bounds listed
+below, including path-safe object IDs of at most 64 characters and tag lists
+of at most 100 entries. Clients must validate those bounds before invoking a
+tool. Split tag additions larger than 100 into multiple `add_tags` calls; each
+call requires its own confirmation. Update clients that send IDs or other
+fields outside the documented bounds before upgrading. The server rejects
+out-of-bound inputs before issuing a confirmation token or contacting
+Substack.
+
 ## Tool risk and limits
 
 All tools make requests to the configured Substack account. Read tools are

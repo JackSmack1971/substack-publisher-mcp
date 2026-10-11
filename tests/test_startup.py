@@ -19,6 +19,7 @@ async def test_installed_server_initializes_and_lists_tools():
             async with ClientSession(read, write) as session:
                 initialized = await session.initialize()
                 assert initialized.server_info.name == "substack-publisher-mcp"
+                assert initialized.server_info.version == "0.2.0"
                 tools = await session.list_tools()
                 assert {tool.name for tool in tools.tools} == {
                     "list_drafts", "list_published", "get_draft", "get_sections",

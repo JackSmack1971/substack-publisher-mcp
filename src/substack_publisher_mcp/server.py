@@ -34,7 +34,7 @@ logger = logging.getLogger(__name__)
 
 mcp = MCPServer(
     name="substack-publisher-mcp",
-    version="0.1.0",
+    version="0.2.0",
     instructions=(
         "Tools for creating, editing, and publishing Substack posts. Content is "
         "authored in Markdown (CommonMark), which renders as real formatting on "
