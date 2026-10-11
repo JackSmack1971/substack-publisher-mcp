@@ -240,6 +240,35 @@ def test_redirect_is_rejected_without_following_destination(monkeypatch):
     session.close()
 
 
+@pytest.mark.parametrize("location", [
+    "https://evil.example/",
+    "http://brettousignant.substack.com/",
+    "https://brettousignant.substack.com/?token=x",
+    "https://brettousignant.substack.com/#fragment",
+    "https://brettousignant.substack.com:444/",
+    "https://user@brettousignant.substack.com/",
+    "https://brettousignant.substack.com.evil.test/",
+    "https://brettousignant.substack.com/%zz",
+])
+def test_observed_redirect_rejects_unverified_or_malformed_destinations(location):
+    assert live_verify.RestrictedSession._observed_redirect_target(location) is None
+
+
+def test_observed_redirect_requires_exact_source_and_destination():
+    session = live_verify.RestrictedSession("brettousignant.substack.com")
+    assert session._is_observed_signin(
+        "https://substack.com/sign-in?redirect=%2F&for_pub=brettousignant"
+    )
+    assert not session._is_observed_signin(
+        "https://substack.com/sign-in?redirect=%2F&for_pub=another-publication"
+    )
+    assert not session._observed_redirect_target("/" )
+    assert session._observed_redirect_target(
+        "https://brettousignant.substack.com/"
+    ) == "https://brettousignant.substack.com/"
+    session.close()
+
+
 @pytest.mark.parametrize(
     "status,expected",
     [(401, "AUTH_FAILURE"), (403, "PERMISSION_DENIED"), (404, "ENDPOINT_DRIFT"),
