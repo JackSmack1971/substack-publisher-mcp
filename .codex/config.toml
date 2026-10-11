@@ -1,0 +1,25 @@
+# Behavioral/orchestration defaults only. This file is not an authorization boundary.
+# Explicit runtime permissions, trusted project settings, and managed policy take precedence.
+approval_policy = "on-request"
+
+[agents]
+max_concurrent_threads_per_session = 4
+# Schema-valid in Codex CLI 0.162.1 (typed integer) but absent from the official docs reviewed;
+# not proof of runtime or security isolation.
+max_depth = 1
+
+[agents.mcp_researcher]
+description = "Read-only research of MCP protocol and SDK compatibility"
+config_file = ".codex/agents/mcp-researcher.toml"
+
+[agents.mcp_implementer]
+description = "Single owner for bounded MCP server implementation"
+config_file = ".codex/agents/mcp-implementer.toml"
+
+[agents.mcp_security]
+description = "Independent MCP security and trust-boundary reviewer"
+config_file = ".codex/agents/mcp-security.toml"
+
+[agents.mcp_verifier]
+description = "Independent test and protocol compatibility verifier"
+config_file = ".codex/agents/mcp-verifier.toml"

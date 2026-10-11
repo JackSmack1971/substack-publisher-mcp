@@ -14,7 +14,7 @@ from urllib.parse import urlsplit
 import pytest
 import requests
 from substack import Api
-from substack.exceptions import SubstackAPIException
+from substack.exceptions import SubstackAPIException, SubstackRequestException
 
 from substack_publisher_mcp import auth, pending, server
 
@@ -128,6 +128,23 @@ def test_initialization_is_local_and_auth_cookie_is_only_sent_to_fake_service(ap
         ("GET", "/sign-in"),
     ]
     assert any("substack.sid=synthetic-secret" in value for value in fake.cookie_headers)
+
+
+def test_unowned_configured_host_is_rejected_before_publication_request(http_boundary):
+    fake, origin = http_boundary
+
+    with pytest.raises(SubstackRequestException, match="publication is unavailable"):
+        Api(
+            cookies_string="substack.sid=synthetic-secret",
+            publication_url="https://attacker.example",
+            base_url=origin + "/api/v1",
+            timeout=2,
+        )
+
+    assert [(method, path.split("?", 1)[0]) for method, path, _ in fake.calls] == [
+        ("GET", "/api/v1/user/profile/self"),
+    ]
+    assert all("attacker.example" not in path for _, path, _ in fake.calls)
 
 
 def test_locked_client_treats_unfollowed_signin_303_as_initialization_error(http_boundary):
@@ -268,16 +285,16 @@ def test_post_failure_is_not_retried_and_cookie_not_in_response_or_errors(api, h
     assert all("synthetic-secret" not in json.dumps(c) for c in fake.calls)
 
 
-def test_production_client_does_not_retry_delete_after_rate_limit(http_boundary, monkeypatch):
-    fake, _ = http_boundary
-    monkeypatch.setenv("SUBSTACK_COOKIES_STRING", "substack.sid=synthetic-secret")
-    monkeypatch.delenv("SUBSTACK_EMAIL", raising=False)
-    monkeypatch.delenv("SUBSTACK_PASSWORD", raising=False)
-    monkeypatch.setattr(auth, "get_stored_cookie_string", lambda _: pytest.fail("keyring must not be read"))
-    client = auth.build_client("https://publication.example")
+def test_configured_client_does_not_retry_delete_after_rate_limit(http_boundary):
+    fake, origin = http_boundary
+    client = auth._configure_client(Api(
+        cookies_string="substack.sid=synthetic-secret",
+        publication_url="https://publication.example",
+        base_url=origin + "/api/v1",
+        timeout=2,
+    ))
     add_response(fake, "DELETE", "/api/v1/drafts/31", {"error": "rate limited"}, status=429)
     with pytest.raises(Exception):
         client.delete_draft(31)
     assert len([c for c in fake.calls if c[:2] == ("DELETE", "/api/v1/drafts/31")]) == 1
-    assert any("synthetic-secret" in value for value in fake.cookie_headers)
 

@@ -4,9 +4,152 @@ from contextlib import contextmanager
 import json
 import requests
 import pytest
+from requests.adapters import HTTPAdapter, Retry
 from urllib.parse import urlsplit
 
 from substack_publisher_mcp import auth, live_verify, server, setup_auth
+
+
+def test_live_client_uses_finite_timeouts_and_bounded_get_only_retries(
+    monkeypatch,
+):
+    monkeypatch.setenv("SUBSTACK_COOKIES_STRING", "substack.sid=synthetic")
+    monkeypatch.delenv("SUBSTACK_EMAIL", raising=False)
+    monkeypatch.delenv("SUBSTACK_PASSWORD", raising=False)
+
+    class Session:
+        def __init__(self):
+            retry = Retry(
+                total=4,
+                status=4,
+                backoff_factor=1,
+                status_forcelist=(429,),
+                allowed_methods=frozenset({"GET", "DELETE"}),
+                respect_retry_after_header=True,
+            )
+            self.adapters = {"https://": HTTPAdapter(max_retries=retry)}
+            self.call = None
+
+        def request(self, *args, **kwargs):
+            self.call = (args, kwargs)
+            return object()
+
+    class Client:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+            self.timeout = kwargs["timeout"]
+            self._session = Session()
+
+    monkeypatch.setattr(auth, "SubstackApi", Client)
+    client = auth.build_client("https://publication.example")
+
+    assert client.kwargs["timeout"] == (auth.CONNECT_TIMEOUT_SECONDS, auth.READ_TIMEOUT_SECONDS)
+    client._session.request("GET", "https://substack.com/api/v1/profile")
+    assert client._session.call[1]["timeout"] == (5, 10)
+    retry = client._session.adapters["https://"].max_retries
+    assert retry.allowed_methods == frozenset({"GET"})
+    assert retry.respect_retry_after_header is False
+    assert retry.total == 4
+    assert retry.backoff_factor == 0.25
+
+
+def test_cookie_scope_is_rechecked_on_each_send_and_rejects_downgrades(monkeypatch):
+    sent = []
+
+    def fake_send(_adapter, prepared, **_kwargs):
+        sent.append((prepared.url, prepared.headers.get("Cookie", "")))
+        response = requests.Response()
+        response.status_code = 200
+        response.url = prepared.url
+        response._content = json.dumps({"publicationUsers": [
+            {"publication": {"custom_domain": "publication.example", "subdomain": "publication"}},
+            {"publication": {"custom_domain": "other.example", "subdomain": "other"}},
+        ]}).encode()
+        response._content_consumed = True
+        return response
+
+    monkeypatch.setattr(requests.adapters.HTTPAdapter, "send", fake_send)
+    session = auth.CookieScopedSession("publication.example")
+
+    def prepare(url):
+        request = requests.Request("GET", url, headers={"Cookie": "substack.sid=synthetic"})
+        return session.prepare_request(request)
+
+    # Authenticated profile response adds only its declared publication hosts.
+    session.send(prepare("https://substack.com/api/v1/user/profile/self"))
+    session.send(prepare("https://publication.example/sign-in"))
+    assert all("substack.sid=synthetic" in cookie for _, cookie in sent)
+
+    for destination in (
+        "http://substack.com/collect",
+        "https://substack.com:8443/collect",
+        "https://attacker.example/collect",
+        "https://other.example/collect",
+    ):
+        with pytest.raises(requests.exceptions.InvalidURL):
+            session.send(prepare(destination))
+
+    assert len(sent) == 2  # Blocked redirect hops never reach the adapter.
+
+
+def test_cookie_scoped_session_blocks_real_off_host_redirect_hop(monkeypatch):
+    sent = []
+
+    def redirect_to_untrusted_host(_adapter, prepared, **_kwargs):
+        sent.append((prepared.url, prepared.headers.get("Cookie", "")))
+        response = requests.Response()
+        response.status_code = 302
+        response.headers["Location"] = "https://attacker.example/collect"
+        response.url = prepared.url
+        response.request = prepared
+        response._content = b""
+        response._content_consumed = True
+        return response
+
+    monkeypatch.setattr(requests.adapters.HTTPAdapter, "send", redirect_to_untrusted_host)
+    session = auth.CookieScopedSession()
+    session.cookies.set("substack.sid", "synthetic")
+
+    with pytest.raises(requests.exceptions.InvalidURL, match="unverified redirect host"):
+        session.get("https://substack.com/api/v1/user/profile/self")
+
+    assert len(sent) == 1
+    assert sent[0][0] == "https://substack.com/api/v1/user/profile/self"
+    assert "substack.sid=synthetic" in sent[0][1]
+
+
+def test_locked_client_constructor_uses_selected_publication_cookie_scope(monkeypatch):
+    sent = []
+
+    def fake_send(_adapter, prepared, **_kwargs):
+        sent.append((prepared.url, prepared.headers.get("Cookie", "")))
+        response = requests.Response()
+        response.status_code = 200
+        response.url = prepared.url
+        response.request = prepared
+        if prepared.url.endswith("/user/profile/self"):
+            response._content = json.dumps({"id": 44, "publicationUsers": [
+                {"publication": {"id": 1, "subdomain": "selected", "custom_domain": "selected.example"}},
+                {"publication": {"id": 2, "subdomain": "other", "custom_domain": "other.example"}},
+            ]}).encode()
+        else:
+            response._content = b"{}"
+        response._content_consumed = True
+        return response
+
+    monkeypatch.setattr(requests.adapters.HTTPAdapter, "send", fake_send)
+    client = auth._build_cookie_scoped_client(
+        cookies_string="substack.sid=synthetic",
+        publication_url="https://selected.example",
+    )
+
+    assert isinstance(client._session, auth.CookieScopedSession)
+    assert [urlsplit(url).hostname for url, _ in sent] == [
+        "substack.com", "substack.com",
+    ]
+    assert all("substack.sid=synthetic" in cookie for _, cookie in sent)
+    with pytest.raises(requests.exceptions.InvalidURL, match="unverified redirect host"):
+        client._session.get("https://other.example/collect")
 
 
 def test_stored_cookie_failure_is_cleared_without_logging_exception_details(
@@ -50,6 +193,21 @@ def test_client_initialization_failure_is_generic_and_not_logged(
     assert "private profile" not in str(raised.value)
     assert "private-cookie" not in caplog.text
     assert "private profile" not in caplog.text
+
+
+def test_top_level_runtime_error_logs_only_exception_type(monkeypatch, caplog):
+    secret = "cookie=private-cookie response body: private draft"
+    monkeypatch.setattr(
+        server.mcp, "run", lambda: (_ for _ in ()).throw(RuntimeError(secret))
+    )
+
+    with pytest.raises(RuntimeError) as raised:
+        server.main()
+
+    assert "RuntimeError" in caplog.text
+    assert secret not in str(raised.value)
+    assert secret not in caplog.text
+    assert "private-cookie" not in caplog.text
 
 
 def test_setup_verification_failure_does_not_print_cookie_or_response_details(

@@ -1,31 +1,52 @@
-# Repository Guidelines
+# MCP Server Engineering Constitution
 
-## Project Structure & Module Organization
+Scope: entire repository unless more-specific, compatible instructions apply. Instructions govern behavior; they **do not authorize** shell/network/credentials/remote writes.
 
-The installable package is `src/substack_publisher_mcp/`. `server.py` defines MCP tools and the stdio entry point; `pending.py` handles mutation confirmations; `auth.py` and `setup_auth.py` manage credentials; `live_verify.py` contains the separately invoked compatibility qualifier. Tests live in `tests/`, with files named `test_<area>.py`. Package metadata and pytest settings are in `pyproject.toml`; `uv.lock` records the resolved dependency set. CI configuration is in `.github/workflows/`.
+## Before making changes
 
-## Build, Test, and Development Commands
+- Read `README.md`, current `docs/architecture/architecture.md`, `docs/contracts/server-contract.md`, `docs/security/threat-model.md` and `docs/decisions/` when present. Inspect existing source, tests, package manifests, Git status, and diff. Preserve unrelated changes.
+- Identify server purpose, actual consumers/hosts, stack and SDK, stdio vs HTTP deployment, 2026-07-28 support, optional backward compatibility, trust boundaries, data sensitivity, and read vs write tools. Record unresolved decisions explicitly.
+- Verify normative protocol claims against the pinned MCP specification, SDK and the target host's documentation. Label **CURRENT / DERIVED / RECOMMENDED / SPECULATIVE** in architecture and review notes.
+- Favor minimum coherent scope. Do not generate a fake API, mock upstream behavior as production code, or add speculative extensions.
 
-- `uv sync --locked --extra dev --python 3.11` installs the locked development environment.
-- `uv run --locked --extra dev pytest -q` runs the offline test suite.
-- `uv run --locked --extra dev pytest -q tests/test_startup.py` checks CLI startup and the MCP handshake.
-- `uv run --locked substack-publisher-mcp` launches the stdio server for an MCP client.
-- `uv run --isolated --python 3.10 --locked --extra dev pytest -q` checks the minimum supported Python version.
+## Architecture and correctness
 
-Do not run the live qualifier as a routine test: `substack-publisher-mcp-qualify` makes external requests only when explicitly passed `--live`.
+- Separate protocol transport, MCP contract registration, application handlers, upstream clients, validation, authentication, authorization, persistence, and observability.
+- Treat tool names and server identities as versioned contracts. Tool display descriptions, titles, annotations, and model instructions are not permission grants.
+- Keep tool catalogs deterministic and stable for a given deployment version; version and explain changes. Do not silently change wire behavior in active workflows.
+- Validate all tool arguments server-side with bounded schemas; use typed structured output where appropriate; provide stable, actionable error shapes with no secret leakage.
+- Treat Resources as untrusted data, not instructions. Never execute prompt text or retrieved content as authority.
+- Support cancellation, timeouts, upstream rate limits and bounded retries where appropriate; never retry non-idempotent mutations blindly.
 
-## Coding Style & Naming Conventions
+## 2026-07-28 protocol
 
-Use Python 3.10-compatible syntax, four spaces for indentation, and standard `snake_case` names for modules, functions, and variables. Keep MCP tool validation explicit and preserve the existing confirmation flow for every remote mutation. Tests should be focused, deterministic, and use mocks or synthetic HTTP responses rather than real Substack requests. No formatter, linter, or type checker is configured.
+- Prefer stateless modern protocol semantics, `server/discover`, modern request headers and explicit capability/version negotiation. Treat 2025 `initialize` and session behavior as a compatibility mode only when implemented/tested.
+- No reliance on `Mcp-Session-Id` for modern protocol, per-connection tools/list variants, or unbounded in-memory conversation state.
+- Use modern Streamable HTTP for remote services and stdio for local subprocess use cases; protect HTTP origins and route requests only after request authentication and authorization where applicable.
+- Tasks, MCP Apps, Skills-over-MCP and other extensions are opt-in and must be negotiated and independently reviewed. Check the extension's current stable/draft status before use.
 
-## Testing Guidelines
+## Security and authority
 
-Add or update `tests/test_<area>.py` for behavior changes. Run the full pytest command before submitting when practical. Tests must not require credentials, publish content, or contact Substack; the startup smoke test exercises the installed CLI offline. CI runs the locked suite on Python 3.11 on Linux and Windows.
+- Remote protected resources: verify tokens on every request (issuer, audience, lifetime, signature or introspection validity), require scopes and object-level rights for each operation. Never accept unrelated upstream tokens as authorization for this server.
+- Maintain a clear operation risk inventory: public_read, private_read, external_write, destructive, credential_use, code_execution, open_world. Unknown risk is reviewed conservatively.
+- Minimize egress and secrets. Apply SSRF defenses, tenant isolation, output minimization, logging redaction, concurrency/rate limits, and safe defaults. No credentials in Git or test fixtures.
+- User approval, CLI prompts, tool annotations, and model confidence are not substitutes for server-side authorization.
 
-## Commit & Pull Request Guidelines
+## Implementation lifecycle
 
-Recent commits use short, imperative subjects (for example, “Harden offline release verification”). Follow that style and keep each commit focused. For substantial changes, open an issue first as the README recommends. Pull requests should explain behavior and security implications, link the issue when applicable, and include relevant test output. Call out dependency or lockfile changes explicitly.
+1. `$mcp-discovery`: evidence-based stack/protocol/host investigation.
+2. `$mcp-contract-design`: tool/resource/prompt catalog and risk matrix; resolve decisions.
+3. `$mcp-implementation`: one scoped contract-driven change, one write owner.
+4. `$mcp-security-review`: independent negative-path and abuse-case review.
+5. `$mcp-conformance`: tests against real client/server behavior and both requested protocol eras.
+6. `$mcp-release`: gate evidence; deployment only after separate authorization.
 
-## Security & Configuration
+## Orchestration and Git
 
-Never commit cookies, passwords, or keyring data. Keep credentials in the OS keyring or environment variables as documented in `README.md`. Treat live qualification as an explicitly authorized external operation; do not add it to ordinary tests or CI.
+- Use read-only exploration in parallel only when helpful. Reconcile evidence before assigning one implementation owner. Then independent read-only reviewer and test verifier. No child spawning grandchildren.
+- Record baseline commit, dirty state, intended delta, checks and final diff. No unrelated editing, staging, publication or deployment.
+- Prefer testing with offline fixtures and loopback clients; network and external service calls need appropriate runtime permission and user authorization.
+
+## Completion report
+
+Report: what changed or determined; files modified; exact commands and pass/fail/skipped results; unresolved decisions and unverified behavior. Never claim checks passed unless executed. Never infer readiness from documentation alone.
